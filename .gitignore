@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+venv/
+env/
+.env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Training checkpoints (large model files)
+checkpoints/
+*.pt
+
+# Training logs & history
+logs/
+sweep_logs/
+sweep_checkpoints/
+runs/
+
+# Results (generated figures) — can regenerate
+results/
+results_*/
+
+# Old experiment data
+experiments/
+tmp_speed_test/
+run_logs/
+
+# Large log files
+*.log
+
+# PDF papers
+*.pdf
+
+# Gemini/Antigravity
+.gemini/
+.agent/
