@@ -334,7 +334,10 @@ class MADDPG:
         )
 
     def load(self, path):
-        ckpt = torch.load(path, map_location=self.device)
+        try:
+            ckpt = torch.load(path, map_location=self.device, weights_only=True)
+        except TypeError:
+            ckpt = torch.load(path, map_location=self.device)
         self.mu_actor.load_state_dict(ckpt["mu_actor"])
         self.uav_actor.load_state_dict(ckpt["uav_actor"])
         self.critic.load_state_dict(ckpt["critic"])

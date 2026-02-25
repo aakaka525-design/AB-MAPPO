@@ -204,9 +204,8 @@ class GaussianActor(nn.Module):
 
         if 'continuous_dist' in dists:
             dist = dists['continuous_dist']
-            cont_action = action[:, col:col + self.continuous_dim]
-            cont_action = torch.clamp(cont_action, 1e-6, 1 - 1e-6)
-            raw_action = torch.log(cont_action / (1 - cont_action + 1e-8) + 1e-8)
+            cont_action = action[:, col:col + self.continuous_dim].clamp(1e-6, 1 - 1e-6)
+            raw_action = torch.logit(cont_action)
             lp = dist.log_prob(raw_action).sum(dim=-1)
             lp -= torch.log(cont_action * (1 - cont_action) + 1e-8).sum(dim=-1)
             log_probs.append(lp)

@@ -16,11 +16,12 @@ class RolloutBuffer:
     支持异构智能体 (MU和UAV有不同的obs/action维度)
     """
 
-    def __init__(self, num_agents, obs_dim, action_dim, buffer_size, gamma=0.99, gae_lambda=0.95):
+    def __init__(self, num_agents, obs_dim, action_dim, buffer_size, gamma=0.99, gae_lambda=0.95, state_dim=None):
         self.num_agents = num_agents
         self.buffer_size = buffer_size
         self.gamma = gamma
         self.gae_lambda = gae_lambda
+        self.state_dim = state_dim
         self.pos = 0
         self.full = False
 
@@ -31,12 +32,15 @@ class RolloutBuffer:
         self.rewards = np.zeros((buffer_size, num_agents), dtype=np.float32)
         self.values = np.zeros((buffer_size, num_agents), dtype=np.float32)
         self.dones = np.zeros((buffer_size,), dtype=np.float32)
+        self.states = None
+        if self.state_dim is not None:
+            self.states = np.zeros((buffer_size, self.state_dim), dtype=np.float32)
 
         # GAE计算后的数据
         self.advantages = np.zeros((buffer_size, num_agents), dtype=np.float32)
         self.returns = np.zeros((buffer_size, num_agents), dtype=np.float32)
 
-    def add(self, obs, action, log_prob, reward, value, done):
+    def add(self, obs, action, log_prob, reward, value, done, state=None):
         """添加一步数据"""
         self.observations[self.pos] = obs
         self.actions[self.pos] = action
@@ -44,6 +48,10 @@ class RolloutBuffer:
         self.rewards[self.pos] = reward
         self.values[self.pos] = value
         self.dones[self.pos] = done
+        if self.states is not None:
+            if state is None:
+                raise ValueError("state is required when state_dim is set")
+            self.states[self.pos] = state
         self.pos += 1
         if self.pos >= self.buffer_size:
             self.full = True
@@ -89,7 +97,7 @@ class RolloutBuffer:
         else:
             indices = np.random.choice(size, batch_size, replace=False)
 
-        return {
+        batch = {
             'observations': torch.FloatTensor(self.observations[indices]),
             'actions': torch.FloatTensor(self.actions[indices]),
             'log_probs': torch.FloatTensor(self.log_probs[indices]),
@@ -97,6 +105,9 @@ class RolloutBuffer:
             'returns': torch.FloatTensor(self.returns[indices]),
             'values': torch.FloatTensor(self.values[indices]),
         }
+        if self.states is not None:
+            batch['states'] = torch.FloatTensor(self.states[indices])
+        return batch
 
     def reset(self):
         self.pos = 0
@@ -112,7 +123,7 @@ class MultiAgentRolloutBuffer:
 
     def __init__(self, num_mus, num_uavs, mu_obs_dim, uav_obs_dim,
                  mu_action_dim, uav_action_dim, buffer_size,
-                 gamma_mu=None, gamma_uav=None):
+                 gamma_mu=None, gamma_uav=None, state_dim=None):
         self.num_mus = num_mus
         self.num_uavs = num_uavs
         self.buffer_size = buffer_size
@@ -123,17 +134,17 @@ class MultiAgentRolloutBuffer:
 
         self.mu_buffer = RolloutBuffer(
             num_mus, mu_obs_dim, mu_action_dim,
-            buffer_size, gamma=gamma_mu, gae_lambda=cfg.GAE_LAMBDA
+            buffer_size, gamma=gamma_mu, gae_lambda=cfg.GAE_LAMBDA, state_dim=state_dim
         )
         self.uav_buffer = RolloutBuffer(
             num_uavs, uav_obs_dim, uav_action_dim,
-            buffer_size, gamma=gamma_uav, gae_lambda=cfg.GAE_LAMBDA
+            buffer_size, gamma=gamma_uav, gae_lambda=cfg.GAE_LAMBDA, state_dim=state_dim
         )
 
     def add(self, mu_obs, mu_action, mu_log_prob, mu_reward, mu_value,
-            uav_obs, uav_action, uav_log_prob, uav_reward, uav_value, done):
-        self.mu_buffer.add(mu_obs, mu_action, mu_log_prob, mu_reward, mu_value, done)
-        self.uav_buffer.add(uav_obs, uav_action, uav_log_prob, uav_reward, uav_value, done)
+            uav_obs, uav_action, uav_log_prob, uav_reward, uav_value, done, state=None):
+        self.mu_buffer.add(mu_obs, mu_action, mu_log_prob, mu_reward, mu_value, done, state=state)
+        self.uav_buffer.add(uav_obs, uav_action, uav_log_prob, uav_reward, uav_value, done, state=state)
         self.pos = self.mu_buffer.pos
 
     def compute_gae(self, mu_last_values, uav_last_values):

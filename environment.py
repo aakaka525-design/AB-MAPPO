@@ -132,8 +132,10 @@ class UAVMECEnv:
         self.mu_positions[below_y, 1] *= -1.0
         self.mu_positions[above_y, 1] = 2 * self.area_height - self.mu_positions[above_y, 1]
 
-        bounced = below_x | above_x | below_y | above_y
-        self.mu_directions[bounced] = np.pi - self.mu_directions[bounced]
+        bounced_x = below_x | above_x
+        bounced_y = below_y | above_y
+        self.mu_directions[bounced_x] = np.pi - self.mu_directions[bounced_x]
+        self.mu_directions[bounced_y] = -self.mu_directions[bounced_y]
         self.mu_positions[:, 0] = np.clip(self.mu_positions[:, 0], 0.0, self.area_width)
         self.mu_positions[:, 1] = np.clip(self.mu_positions[:, 1], 0.0, self.area_height)
 

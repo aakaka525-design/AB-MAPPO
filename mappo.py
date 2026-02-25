@@ -100,6 +100,7 @@ class ABMAPPO:
             mu_action_dim=self.mu_action_dim,
             uav_action_dim=self.uav_action_dim,
             buffer_size=cfg.EPISODE_LENGTH,
+            state_dim=env.state_dim,
         )
 
         # 奖励归一化
@@ -173,6 +174,7 @@ class ABMAPPO:
         ep_info = []
 
         for t in range(cfg.EPISODE_LENGTH):
+            state = self.env.get_state().copy()
             (mu_act_env, uav_act_env, mu_act_store, uav_act_store,
              mu_lp, uav_lp) = self.get_actions(obs)
             mu_val, uav_val = self.get_values(obs)
@@ -193,6 +195,7 @@ class ABMAPPO:
                 uav_obs=obs['uav_obs'], uav_action=uav_act_store,
                 uav_log_prob=uav_lp, uav_reward=uav_r_norm, uav_value=uav_val,
                 done=float(done),
+                state=state,
             )
             ep_info.append(info)
             ep_info[-1]['raw_mu_reward'] = mu_r.copy()
@@ -320,15 +323,22 @@ class ABMAPPO:
         uav_ret = uav_data['returns'].to(self.device).mean(dim=1, keepdim=True)
         avg_ret = (mu_ret + uav_ret) / 2
 
-        mu_obs = mu_data['observations'].to(self.device)
-        uav_obs = uav_data['observations'].to(self.device)
-        state = torch.cat([mu_obs.mean(dim=1), uav_obs.mean(dim=1)], dim=1)
+        if 'states' not in mu_data or 'states' not in uav_data:
+            raise KeyError("MLP critic update requires `states` in both MU and UAV batches")
 
-        if state.shape[1] < self.critic_obs_dim:
-            pad = torch.zeros(state.shape[0], self.critic_obs_dim - state.shape[1], device=self.device)
-            state = torch.cat([state, pad], dim=1)
-        elif state.shape[1] > self.critic_obs_dim:
-            state = state[:, :self.critic_obs_dim]
+        mu_states = mu_data['states'].to(self.device)
+        uav_states = uav_data['states'].to(self.device)
+
+        if mu_states.shape != uav_states.shape:
+            raise ValueError(f"State batch shape mismatch: MU={mu_states.shape}, UAV={uav_states.shape}")
+        if mu_states.shape[1] != self.critic_obs_dim:
+            raise ValueError(
+                f"State dim mismatch for MLP critic: expected {self.critic_obs_dim}, got {mu_states.shape[1]}"
+            )
+        if not torch.allclose(mu_states, uav_states):
+            raise ValueError("MU and UAV buffered states must be identical for centralized MLP critic")
+
+        state = mu_states
 
         values = self.critic(state)
         loss = 0.5 * ((values - avg_ret) ** 2).mean()
@@ -348,7 +358,10 @@ class ABMAPPO:
         }, path)
 
     def load(self, path):
-        ckpt = torch.load(path, map_location=self.device)
+        try:
+            ckpt = torch.load(path, map_location=self.device, weights_only=True)
+        except TypeError:
+            ckpt = torch.load(path, map_location=self.device)
         self.mu_actor.load_state_dict(ckpt['mu_actor'])
         self.uav_actor.load_state_dict(ckpt['uav_actor'])
         self.critic.load_state_dict(ckpt['critic'])
