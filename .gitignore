@@ -44,8 +44,9 @@ run_logs/
 # Large log files
 *.log
 
-# PDF papers
+# PDF papers (except docs/)
 *.pdf
+!docs/*.pdf
 
 # Gemini/Antigravity
 .gemini/
