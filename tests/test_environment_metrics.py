@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -57,6 +58,44 @@ class TestEnvironmentMetrics(unittest.TestCase):
         self.assertTrue(np.all(obs["mu_obs"] <= 1.0))
         self.assertTrue(np.all(obs["uav_obs"] >= 0.0))
         self.assertTrue(np.all(obs["uav_obs"] <= 1.0))
+
+    def test_mu_direction_bounce_on_x_boundary(self):
+        env = UAVMECEnv(num_mus=1, num_uavs=1, area_width=10.0, area_height=10.0)
+        env.reset()
+        env.mu_positions[0] = np.array([9.5, 5.0], dtype=np.float32)
+        env.mu_velocities[0] = 2.0
+        env.mu_directions[0] = 0.0
+
+        zeros = lambda loc, scale, size: np.zeros(size, dtype=np.float32)
+        with patch.object(cfg, "MU_MEMORY_FACTOR_V", 1.0), patch.object(cfg, "MU_MEMORY_FACTOR_THETA", 1.0), patch(
+            "environment.np.random.normal", side_effect=zeros
+        ):
+            env._update_mu_mobility()
+
+        self.assertAlmostEqual(float(env.mu_directions[0]), float(np.pi), places=6)
+        self.assertGreaterEqual(float(env.mu_positions[0, 0]), 0.0)
+        self.assertLessEqual(float(env.mu_positions[0, 0]), 10.0)
+        self.assertGreaterEqual(float(env.mu_positions[0, 1]), 0.0)
+        self.assertLessEqual(float(env.mu_positions[0, 1]), 10.0)
+
+    def test_mu_direction_bounce_on_y_boundary(self):
+        env = UAVMECEnv(num_mus=1, num_uavs=1, area_width=10.0, area_height=10.0)
+        env.reset()
+        env.mu_positions[0] = np.array([5.0, 9.5], dtype=np.float32)
+        env.mu_velocities[0] = 2.0
+        env.mu_directions[0] = np.pi / 2.0
+
+        zeros = lambda loc, scale, size: np.zeros(size, dtype=np.float32)
+        with patch.object(cfg, "MU_MEMORY_FACTOR_V", 1.0), patch.object(cfg, "MU_MEMORY_FACTOR_THETA", 1.0), patch(
+            "environment.np.random.normal", side_effect=zeros
+        ):
+            env._update_mu_mobility()
+
+        self.assertAlmostEqual(float(env.mu_directions[0]), float(-np.pi / 2.0), places=6)
+        self.assertGreaterEqual(float(env.mu_positions[0, 0]), 0.0)
+        self.assertLessEqual(float(env.mu_positions[0, 0]), 10.0)
+        self.assertGreaterEqual(float(env.mu_positions[0, 1]), 0.0)
+        self.assertLessEqual(float(env.mu_positions[0, 1]), 10.0)
 
 
 if __name__ == "__main__":
