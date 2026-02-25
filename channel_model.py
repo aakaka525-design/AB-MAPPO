@@ -93,6 +93,31 @@ def compute_mu_uav_rate(mu_pos, uav_pos, bandwidth):
     return rate
 
 
+def compute_mu_uav_rate_batch(mu_positions, uav_positions, bandwidths):
+    """
+    批量计算 MU-UAV 传输速率。
+
+    Args:
+        mu_positions: shape (N, 2|3)
+        uav_positions: shape (N, 2|3)
+        bandwidths: shape (N,)
+    Returns:
+        shape (N,) 的速率数组
+    """
+    mu_positions = np.asarray(mu_positions, dtype=np.float32)
+    uav_positions = np.asarray(uav_positions, dtype=np.float32)
+    bandwidths = np.asarray(bandwidths, dtype=np.float32)
+
+    if mu_positions.shape != uav_positions.shape:
+        raise ValueError(f"mu_positions and uav_positions shape mismatch: {mu_positions.shape} vs {uav_positions.shape}")
+    if bandwidths.ndim != 1 or bandwidths.shape[0] != mu_positions.shape[0]:
+        raise ValueError(
+            f"bandwidths shape mismatch: expected ({mu_positions.shape[0]},), got {bandwidths.shape}"
+        )
+
+    return compute_mu_uav_rate(mu_positions, uav_positions, bandwidths)
+
+
 def compute_uav_bs_rate(uav_pos):
     """
     计算 UAV-BS 中继速率 (公式12, 14)

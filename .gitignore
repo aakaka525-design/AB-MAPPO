@@ -6,6 +6,9 @@ dist/
 build/
 *.egg
 
+# Credentials / secrets
+GPU_config.md
+
 # Virtual environments
 venv/
 .venv/

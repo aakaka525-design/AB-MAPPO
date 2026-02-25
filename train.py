@@ -227,6 +227,7 @@ def train(args):
             wo_dt_noise_mode=args.wo_dt_noise_mode,
             area_width=args.area_width,
             area_height=args.area_height,
+            seed=args.seed,
         )
         agent = _make_agent(env, args.algorithm, device)
 

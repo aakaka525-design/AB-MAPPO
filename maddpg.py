@@ -253,7 +253,9 @@ class MADDPG:
             tp.data.add_(tau * p.data)
 
     def update(self):
-        if self.replay.size < max(cfg.MADDPG_WARMUP_STEPS, cfg.MADDPG_BATCH_SIZE):
+        # Warmup is counted in replay transitions.
+        warmup_transitions = max(cfg.MADDPG_WARMUP_STEPS, cfg.MADDPG_BATCH_SIZE)
+        if self.replay.size < warmup_transitions:
             return {}
 
         updates = max(1, cfg.MADDPG_UPDATES_PER_STEP)

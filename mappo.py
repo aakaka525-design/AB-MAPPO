@@ -28,9 +28,11 @@ class RunningMeanStd:
         self.count = 1e-4
 
     def update(self, x):
+        x = np.asarray(x, dtype=np.float64)
         batch_mean = np.mean(x)
+        # Per-step normalization: treat the current timestep aggregate as one sample.
         batch_var = np.var(x)
-        batch_count = x.size if hasattr(x, 'size') else 1
+        batch_count = 1.0
         delta = batch_mean - self.mean
         tot_count = self.count + batch_count
         self.mean = self.mean + delta * batch_count / tot_count

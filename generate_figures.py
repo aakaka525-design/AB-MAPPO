@@ -5,6 +5,10 @@ Input:
 - Aggregated sweep results in experiments/{fig}/aggregate/*.json
 Output:
 - PNG figures under results/
+
+Note:
+- Fig.13 is a deterministic heuristic trajectory visualization, not a direct
+  rendering of aggregate JSON outputs.
 """
 
 from __future__ import annotations
@@ -12,7 +16,51 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
+import tempfile
 from typing import Dict, List
+
+
+def _is_writable_dir(path: str) -> bool:
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError:
+        return False
+
+    probe = os.path.join(path, ".write_probe")
+    try:
+        with open(probe, "w", encoding="utf-8") as f:
+            f.write("ok")
+    except OSError:
+        return False
+    finally:
+        try:
+            if os.path.exists(probe):
+                os.remove(probe)
+        except OSError:
+            pass
+    return True
+
+
+def _ensure_writable_mplconfigdir(candidates: List[str] | None = None) -> str | None:
+    existing = os.environ.get("MPLCONFIGDIR")
+    if existing:
+        return existing
+
+    if candidates is None:
+        candidates = [
+            os.path.join(tempfile.gettempdir(), "ab_mappo_mplconfig"),
+            os.path.join(os.getcwd(), ".mplconfig"),
+        ]
+
+    for path in candidates:
+        if _is_writable_dir(path):
+            os.environ["MPLCONFIGDIR"] = path
+            return path
+    return None
+
+
+_ensure_writable_mplconfigdir()
 
 import matplotlib
 import numpy as np
@@ -38,6 +86,18 @@ MARKERS = {
     "MADDPG": "D",
     "Randomized": "x",
 }
+K_SERIES_PATTERN = re.compile(r"^K=(\d+)$")
+
+
+def _sort_series_labels_by_k(labels: List[str]) -> List[str]:
+    parsed = []
+    for label in labels:
+        m = K_SERIES_PATTERN.match(label)
+        if m is None:
+            return sorted(labels)
+        parsed.append((int(m.group(1)), label))
+    parsed.sort(key=lambda x: x[0])
+    return [label for _, label in parsed]
 
 
 def _ensure_dir(path):
@@ -269,7 +329,9 @@ def plot_fig10(exp_root, output_dir):
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5))
 
     x1 = np.asarray(data["mu_cpu"]["x_values"], dtype=float)
-    for i, (k, series) in enumerate(sorted(data["mu_cpu"]["series"].items())):
+    sorted_mu_labels = _sort_series_labels_by_k(list(data["mu_cpu"]["series"].keys()))
+    for i, k in enumerate(sorted_mu_labels):
+        series = data["mu_cpu"]["series"][k]
         y = np.asarray(series["mean"], dtype=float)
         y_std = np.asarray(series["std"], dtype=float)
         c = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728"][i % 4]
@@ -282,7 +344,9 @@ def plot_fig10(exp_root, output_dir):
     ax1.legend()
 
     x2 = np.asarray(data["uav_cpu"]["x_values"], dtype=float)
-    for i, (k, series) in enumerate(sorted(data["uav_cpu"]["series"].items())):
+    sorted_uav_labels = _sort_series_labels_by_k(list(data["uav_cpu"]["series"].keys()))
+    for i, k in enumerate(sorted_uav_labels):
+        series = data["uav_cpu"]["series"][k]
         y = np.asarray(series["mean"], dtype=float)
         y_std = np.asarray(series["std"], dtype=float)
         c = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728"][i % 4]
@@ -305,7 +369,9 @@ def plot_fig11(exp_root, output_dir):
     data = _load_json(p)
     x = np.asarray(data["x_values"], dtype=float)
     fig, ax = plt.subplots(figsize=(8, 5))
-    for i, (label, series) in enumerate(sorted(data["series"].items())):
+    sorted_labels = _sort_series_labels_by_k(list(data["series"].keys()))
+    for i, label in enumerate(sorted_labels):
+        series = data["series"][label]
         y = np.asarray(series["mean"], dtype=float)
         y_std = np.asarray(series["std"], dtype=float)
         c = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728"][i % 4]
@@ -363,7 +429,7 @@ def plot_fig12(exp_root, output_dir):
     _save(fig, output_dir, "fig12_vs_tasksize.png")
 
 
-def _make_corner_positions(width, height, m):
+def _make_corner_positions(width, height, m, rng):
     base = np.array(
         [
             [0.05 * width, 0.05 * height],
@@ -377,29 +443,38 @@ def _make_corner_positions(width, height, m):
         return base[:m].copy()
     reps = int(np.ceil(m / 4))
     arr = np.vstack([base for _ in range(reps)])[:m]
-    arr += np.random.normal(0.0, 0.03 * min(width, height), size=arr.shape)
+    arr += rng.normal(0.0, 0.03 * min(width, height), size=arr.shape)
     arr[:, 0] = np.clip(arr[:, 0], 0.0, width)
     arr[:, 1] = np.clip(arr[:, 1], 0.0, height)
     return arr
 
 
-def _run_heuristic_trajectory(scenario):
+def _run_heuristic_trajectory(scenario, seed):
+    rng = np.random.default_rng(seed)
     k = scenario["K"]
     m = scenario["M"]
     w = scenario["W"]
     t_horizon = scenario["T"]
-    env = UAVMECEnv(num_mus=k, num_uavs=m, area_width=w, area_height=w, dt_deviation_rate=0.0, wo_dt_noise_mode=False)
+    env = UAVMECEnv(
+        num_mus=k,
+        num_uavs=m,
+        area_width=w,
+        area_height=w,
+        dt_deviation_rate=0.0,
+        wo_dt_noise_mode=False,
+        rng=rng,
+    )
     env.reset()
 
     if scenario.get("cluster", False):
         centers = np.array([[0.25 * w, 0.25 * w], [0.75 * w, 0.7 * w], [0.55 * w, 0.2 * w]], dtype=np.float32)
         for i in range(k):
-            env.mu_positions[i] = centers[i % len(centers)] + np.random.normal(0, 0.04 * w, size=2)
+            env.mu_positions[i] = centers[i % len(centers)] + rng.normal(0, 0.04 * w, size=2)
         env.mu_positions[:, 0] = np.clip(env.mu_positions[:, 0], 0.0, w)
         env.mu_positions[:, 1] = np.clip(env.mu_positions[:, 1], 0.0, w)
 
     if scenario.get("uav_start", "random") == "corner":
-        env.uav_positions = _make_corner_positions(w, w, m)
+        env.uav_positions = _make_corner_positions(w, w, m, rng)
         env.uav_velocities[:] = 0.0
 
     trajs = [[env.uav_positions[i].copy()] for i in range(m)]
@@ -414,7 +489,7 @@ def _run_heuristic_trajectory(scenario):
         for j in range(m):
             users = np.where(assoc == (j + 1))[0]
             if len(users) == 0:
-                target = env.mu_positions[np.random.randint(0, k)]
+                target = env.mu_positions[rng.integers(0, k)]
             else:
                 target = env.mu_positions[users].mean(axis=0)
             delta = target - env.uav_positions[j]
@@ -429,7 +504,7 @@ def _run_heuristic_trajectory(scenario):
     return env.mu_positions.copy(), trajs
 
 
-def plot_fig13(exp_root, output_dir):
+def plot_fig13(exp_root, output_dir, base_seed):
     _ = exp_root
     scenarios = [
         {"title": "(a) K=12, M=3, W=500m, T=50s", "K": 12, "M": 3, "W": 500, "T": 50, "cluster": True, "uav_start": "random"},
@@ -440,8 +515,8 @@ def plot_fig13(exp_root, output_dir):
     fig, axes = plt.subplots(2, 2, figsize=(13, 12))
     cmap = plt.get_cmap("tab10")
 
-    for ax, sc in zip(axes.flat, scenarios):
-        mu_pos, trajs = _run_heuristic_trajectory(sc)
+    for idx, (ax, sc) in enumerate(zip(axes.flat, scenarios)):
+        mu_pos, trajs = _run_heuristic_trajectory(sc, seed=base_seed + idx)
         ax.scatter(mu_pos[:, 0], mu_pos[:, 1], s=14, c="gray", alpha=0.45, label="MU")
         for i, tr in enumerate(trajs):
             arr = np.asarray(tr)
@@ -464,7 +539,26 @@ def parse_args():
     parser.add_argument("--exp_root", type=str, default=cfg.EXPERIMENT_ROOT)
     parser.add_argument("--output_dir", type=str, default=cfg.RESULT_DIR)
     parser.add_argument("--figs", type=str, default="all", help='all or comma list from "3,4,...,13"')
+    parser.add_argument("--allow-missing", action="store_true", help="allow missing inputs and skip corresponding figs")
+    parser.add_argument("--fig13-seed", type=int, default=20260225, help="base seed for deterministic Fig.13")
     return parser.parse_args()
+
+
+def _required_inputs(exp_root, fig_number):
+    req = {
+        3: [_path(exp_root, "base", "aggregate", "convergence.json")],
+        4: [_path(exp_root, "base", "aggregate", "convergence.json")],
+        5: [_path(exp_root, "base", "aggregate", "convergence.json")],
+        6: [_path(exp_root, "fig6", "aggregate", "results.json")],
+        7: [_path(exp_root, "fig7", "aggregate", "results.json")],
+        8: [_path(exp_root, "fig8", "aggregate", "results.json")],
+        9: [_path(exp_root, "fig9", "aggregate", "results.json")],
+        10: [_path(exp_root, "fig10", "aggregate", "results.json")],
+        11: [_path(exp_root, "fig11", "aggregate", "results.json")],
+        12: [_path(exp_root, "fig12", "aggregate", "results.json")],
+        13: [],
+    }
+    return req[fig_number]
 
 
 def main():
@@ -485,7 +579,7 @@ def main():
         10: lambda: plot_fig10(args.exp_root, args.output_dir),
         11: lambda: plot_fig11(args.exp_root, args.output_dir),
         12: lambda: plot_fig12(args.exp_root, args.output_dir),
-        13: lambda: plot_fig13(args.exp_root, args.output_dir),
+        13: lambda: plot_fig13(args.exp_root, args.output_dir, args.fig13_seed),
     }
 
     if args.figs == "all":
@@ -493,9 +587,21 @@ def main():
     else:
         targets = [int(x.strip()) for x in args.figs.split(",") if x.strip()]
 
+    missing = []
     for n in targets:
         if n not in runners:
             raise ValueError(f"Unsupported figure number: {n}")
+        for p in _required_inputs(args.exp_root, n):
+            if not os.path.exists(p):
+                missing.append((n, p))
+
+    if missing and not args.allow_missing:
+        print("[error] missing required inputs:")
+        for fig_n, p in missing:
+            print(f"  Fig.{fig_n}: {p}")
+        raise SystemExit(2)
+
+    for n in targets:
         print(f"[run] Fig.{n}")
         runners[n]()
 

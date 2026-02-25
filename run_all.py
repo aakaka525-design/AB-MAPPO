@@ -47,25 +47,28 @@ def run_smoke():
     _run([sys.executable, "generate_figures.py", "--figs", "all"])
 
 
-def run_full(max_parallel=3):
+def _build_full_cmd(fig, full_device):
+    return [
+        sys.executable,
+        "train_sweep.py",
+        "--fig",
+        fig,
+        "--seeds",
+        "42,43,44",
+        "--total_steps",
+        "80000",
+        "--episode_length",
+        "300",
+        "--resume",
+        "--disable_tensorboard",
+        "--device",
+        full_device,
+    ]
+
+
+def run_full(max_parallel=3, full_device="cpu"):
     os.makedirs("run_logs", exist_ok=True)
     fig_jobs = ["base", "6", "7", "8", "9", "10", "11", "12"]
-
-    def cmd_for(fig):
-        return [
-            sys.executable,
-            "train_sweep.py",
-            "--fig",
-            fig,
-            "--seeds",
-            "42,43,44",
-            "--total_steps",
-            "80000",
-            "--episode_length",
-            "300",
-            "--resume",
-            "--disable_tensorboard",
-        ]
 
     with ThreadPoolExecutor(max_workers=max_parallel) as ex:
         futures = set()
@@ -74,7 +77,7 @@ def run_full(max_parallel=3):
             while pending and len(futures) < max_parallel:
                 fig = pending.pop(0)
                 log = os.path.join("run_logs", f"full_fig{fig}.log")
-                futures.add(ex.submit(_run_logged, cmd_for(fig), log))
+                futures.add(ex.submit(_run_logged, _build_full_cmd(fig, full_device), log))
 
             done, futures = wait(futures, return_when=FIRST_COMPLETED)
             for fut in done:
@@ -87,6 +90,7 @@ def parse_args():
     p = argparse.ArgumentParser(description="Run full paper reproduction pipeline")
     p.add_argument("--stage", choices=["smoke", "full", "all"], default="smoke")
     p.add_argument("--max_parallel", type=int, default=3, help="parallel figure jobs in full stage")
+    p.add_argument("--full-device", type=str, default="cpu", help="device for full stage train_sweep runs")
     return p.parse_args()
 
 
@@ -95,10 +99,10 @@ def main():
     if args.stage == "smoke":
         run_smoke()
     elif args.stage == "full":
-        run_full(max_parallel=max(1, args.max_parallel))
+        run_full(max_parallel=max(1, args.max_parallel), full_device=args.full_device)
     else:
         run_smoke()
-        run_full(max_parallel=max(1, args.max_parallel))
+        run_full(max_parallel=max(1, args.max_parallel), full_device=args.full_device)
 
 
 if __name__ == "__main__":

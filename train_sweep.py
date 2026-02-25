@@ -111,7 +111,8 @@ def _aggregate_history(algo_dirs, out_path):
         for p in run_dirs:
             h_path = os.path.join(p, "history.npz")
             if os.path.exists(h_path):
-                histories.append(np.load(h_path))
+                with np.load(h_path) as h:
+                    histories.append({k: h[k] for k in h.files})
         if not histories:
             continue
 

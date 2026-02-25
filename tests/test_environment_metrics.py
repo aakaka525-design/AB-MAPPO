@@ -66,10 +66,13 @@ class TestEnvironmentMetrics(unittest.TestCase):
         env.mu_velocities[0] = 2.0
         env.mu_directions[0] = 0.0
 
-        zeros = lambda loc, scale, size: np.zeros(size, dtype=np.float32)
-        with patch.object(cfg, "MU_MEMORY_FACTOR_V", 1.0), patch.object(cfg, "MU_MEMORY_FACTOR_THETA", 1.0), patch(
-            "environment.np.random.normal", side_effect=zeros
-        ):
+        class _ZeroNoiseRNG:
+            @staticmethod
+            def normal(loc, scale, size):
+                return np.zeros(size, dtype=np.float32)
+
+        env.rng = _ZeroNoiseRNG()
+        with patch.object(cfg, "MU_MEMORY_FACTOR_V", 1.0), patch.object(cfg, "MU_MEMORY_FACTOR_THETA", 1.0):
             env._update_mu_mobility()
 
         self.assertAlmostEqual(float(env.mu_directions[0]), float(np.pi), places=6)
@@ -85,10 +88,13 @@ class TestEnvironmentMetrics(unittest.TestCase):
         env.mu_velocities[0] = 2.0
         env.mu_directions[0] = np.pi / 2.0
 
-        zeros = lambda loc, scale, size: np.zeros(size, dtype=np.float32)
-        with patch.object(cfg, "MU_MEMORY_FACTOR_V", 1.0), patch.object(cfg, "MU_MEMORY_FACTOR_THETA", 1.0), patch(
-            "environment.np.random.normal", side_effect=zeros
-        ):
+        class _ZeroNoiseRNG:
+            @staticmethod
+            def normal(loc, scale, size):
+                return np.zeros(size, dtype=np.float32)
+
+        env.rng = _ZeroNoiseRNG()
+        with patch.object(cfg, "MU_MEMORY_FACTOR_V", 1.0), patch.object(cfg, "MU_MEMORY_FACTOR_THETA", 1.0):
             env._update_mu_mobility()
 
         self.assertAlmostEqual(float(env.mu_directions[0]), float(-np.pi / 2.0), places=6)
