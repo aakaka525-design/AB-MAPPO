@@ -11,7 +11,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Beta, Categorical, Normal
-import numpy as np
 import config as cfg
 
 
@@ -280,13 +279,19 @@ class AttentionCritic(nn.Module):
         K = K.reshape(batch_size, N, self.num_heads, self.head_dim).transpose(1, 2)
         V = V.reshape(batch_size, N, self.num_heads, self.head_dim).transpose(1, 2)
 
-        # 注意力分数 (公式49)
-        scale = np.sqrt(self.head_dim)
-        attn_scores = torch.matmul(Q, K.transpose(-2, -1)) / scale  # (B, heads, N, N)
-        attn_weights = F.softmax(attn_scores, dim=-1)
-
-        # 注意力输出 (公式50)
-        attn_output = torch.matmul(attn_weights, V)  # (B, heads, N, head_dim)
+        # 优先使用 PyTorch 融合注意力算子；旧版本回退到手写实现。
+        if hasattr(F, "scaled_dot_product_attention"):
+            attn_output = F.scaled_dot_product_attention(
+                Q.contiguous(),
+                K.contiguous(),
+                V.contiguous(),
+                dropout_p=0.0,
+            )
+        else:
+            scale = float(self.head_dim) ** 0.5
+            attn_scores = torch.matmul(Q, K.transpose(-2, -1)) / scale  # (B, heads, N, N)
+            attn_weights = F.softmax(attn_scores, dim=-1)
+            attn_output = torch.matmul(attn_weights, V)  # (B, heads, N, head_dim)
         attn_output = attn_output.transpose(1, 2).reshape(batch_size, N, -1)  # (B, N, hidden)
 
         # 拼接注意力输出和原始特征

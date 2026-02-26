@@ -7,6 +7,30 @@ import torch
 import numpy as np
 import config as cfg
 
+try:
+    from numba import njit
+except Exception:  # pragma: no cover - optional acceleration path
+    njit = None
+
+
+def _compute_gae_numpy(delta, non_terminal, values, coef):
+    size, num_agents = delta.shape
+    advantages = np.zeros((size, num_agents), dtype=np.float32)
+    returns = np.zeros((size, num_agents), dtype=np.float32)
+    gae = np.zeros((num_agents,), dtype=np.float32)
+
+    for t in range(size - 1, -1, -1):
+        gae = delta[t] + coef * non_terminal[t] * gae
+        advantages[t] = gae
+        returns[t] = gae + values[t]
+    return advantages, returns
+
+
+if njit is not None:
+    _compute_gae_numba = njit(cache=True, fastmath=True)(_compute_gae_numpy)
+else:
+    _compute_gae_numba = None
+
 
 class RolloutBuffer:
     """
@@ -39,9 +63,15 @@ class RolloutBuffer:
         # GAE计算后的数据
         self.advantages = np.zeros((buffer_size, num_agents), dtype=np.float32)
         self.returns = np.zeros((buffer_size, num_agents), dtype=np.float32)
+        self._compute_gae_impl = _compute_gae_numba or _compute_gae_numpy
 
     def add(self, obs, action, log_prob, reward, value, done, state=None):
         """添加一步数据"""
+        if self.pos >= self.buffer_size:
+            raise RuntimeError(
+                f"RolloutBuffer overflow: pos={self.pos}, buffer_size={self.buffer_size}. "
+                "Call reset() before adding new transitions."
+            )
         self.observations[self.pos] = obs
         self.actions[self.pos] = action
         self.log_probs[self.pos] = log_prob
@@ -67,21 +97,28 @@ class RolloutBuffer:
             last_values: (num_agents,) 最后一步的Value估计
         """
         size = self.pos if not self.full else self.buffer_size
-        gae = np.zeros(self.num_agents, dtype=np.float32)
+        if size == 0:
+            return
 
-        for t in reversed(range(size)):
-            if t == size - 1:
-                next_values = last_values
-                next_non_terminal = 1.0 - self.dones[t]
-            else:
-                next_values = self.values[t + 1]
-                next_non_terminal = 1.0 - self.dones[t]
-
-            delta = self.rewards[t] + self.gamma * next_values * next_non_terminal - self.values[t]
-            gae = delta + self.gamma * self.gae_lambda * next_non_terminal * gae
-            self.advantages[t] = gae
-
-        self.returns[:size] = self.advantages[:size] + self.values[:size]
+        non_terminal = 1.0 - self.dones[:size]
+        next_values = np.empty_like(self.values[:size])
+        if size > 1:
+            next_values[:-1] = self.values[1:size]
+        next_values[-1] = last_values
+        delta = (
+            self.rewards[:size]
+            + self.gamma * next_values * non_terminal[:, None]
+            - self.values[:size]
+        ).astype(np.float32, copy=False)
+        coef = np.float32(self.gamma * self.gae_lambda)
+        adv, ret = self._compute_gae_impl(
+            delta,
+            non_terminal.astype(np.float32, copy=False),
+            self.values[:size],
+            coef,
+        )
+        self.advantages[:size] = adv
+        self.returns[:size] = ret
 
     def get_batches(self, batch_size=None):
         """
@@ -93,20 +130,33 @@ class RolloutBuffer:
         size = self.pos if not self.full else self.buffer_size
 
         if batch_size is None or batch_size >= size:
-            indices = np.arange(size)
+            obs = self.observations[:size]
+            actions = self.actions[:size]
+            log_probs = self.log_probs[:size]
+            advantages = self.advantages[:size]
+            returns = self.returns[:size]
+            values = self.values[:size]
+            states = self.states[:size] if self.states is not None else None
         else:
             indices = np.random.choice(size, batch_size, replace=False)
+            obs = self.observations[indices]
+            actions = self.actions[indices]
+            log_probs = self.log_probs[indices]
+            advantages = self.advantages[indices]
+            returns = self.returns[indices]
+            values = self.values[indices]
+            states = self.states[indices] if self.states is not None else None
 
         batch = {
-            'observations': torch.FloatTensor(self.observations[indices]),
-            'actions': torch.FloatTensor(self.actions[indices]),
-            'log_probs': torch.FloatTensor(self.log_probs[indices]),
-            'advantages': torch.FloatTensor(self.advantages[indices]),
-            'returns': torch.FloatTensor(self.returns[indices]),
-            'values': torch.FloatTensor(self.values[indices]),
+            'observations': torch.from_numpy(obs),
+            'actions': torch.from_numpy(actions),
+            'log_probs': torch.from_numpy(log_probs),
+            'advantages': torch.from_numpy(advantages),
+            'returns': torch.from_numpy(returns),
+            'values': torch.from_numpy(values),
         }
-        if self.states is not None:
-            batch['states'] = torch.FloatTensor(self.states[indices])
+        if states is not None:
+            batch['states'] = torch.from_numpy(states)
         return batch
 
     def reset(self):

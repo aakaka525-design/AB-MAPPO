@@ -44,6 +44,21 @@ class UAVMECEnv:
         if rng is not None and seed is not None:
             raise ValueError("Provide either `seed` or `rng`, not both.")
         self.rng = rng if rng is not None else np.random.default_rng(seed)
+        self._norm_xy = np.array(
+            [max(self.area_width, 1.0), max(self.area_height, 1.0)],
+            dtype=np.float32,
+        )
+        self._task_data_scale = np.float32(1.0 / max(cfg.TASK_DATA_MAX, 1e-8))
+        self._task_cpu_scale = np.float32(1.0 / max(cfg.TASK_CPU_CYCLES_MAX, 1e-8))
+        self._edge_load_scale = np.float32(1.0 / (cfg.TASK_DATA_MAX * cfg.TASK_CPU_CYCLES_MAX + 1e-8))
+        self._dist_penalty_scale = np.float32(1.0 / max(self.area_width, self.area_height))
+        self._uav_velocity_scale = np.float32(1.0 / max(cfg.UAV_MAX_VELOCITY, 1e-8))
+        if self.M > 1:
+            rows = np.arange(self.M)
+            mask = rows[:, None] != rows[None, :]
+            self._other_uav_col_idx = np.where(mask)[1]
+        else:
+            self._other_uav_col_idx = None
 
         # MU observation/action dimensions
         self.mu_obs_dim = 2 + self.M * 2 + 2 + self.M
@@ -71,6 +86,19 @@ class UAVMECEnv:
         self.prev_edge_load = np.zeros((self.M, self.K), dtype=np.float32)
         self.prev_offload_ratio = np.zeros((self.K,), dtype=np.float32)
         self._boundary_violation = np.zeros((self.M,), dtype=np.float32)
+        # Pre-allocated work buffers for step() hot path.
+        self._bw_alloc_cache = np.zeros((self.K,), dtype=np.float32)
+        self._cpu_alloc_cache = np.zeros((self.K,), dtype=np.float32)
+        self._edge_load_cache = np.zeros((self.M, self.K), dtype=np.float32)
+        self._t_loc_cache = np.zeros((self.K,), dtype=np.float32)
+        self._e_loc_cache = np.zeros((self.K,), dtype=np.float32)
+        self._mu_energy_cache = np.zeros((self.K,), dtype=np.float32)
+        self._t_edge_cache = np.zeros((self.K,), dtype=np.float32)
+        self._uav_comp_cache = np.zeros((self.M,), dtype=np.float32)
+        self._uav_total_cache = np.zeros((self.M,), dtype=np.float32)
+        self._latency_penalty_cache = np.zeros((self.K,), dtype=np.float32)
+        self._mu_rewards_cache = np.zeros((self.K,), dtype=np.float32)
+        self._uav_rewards_cache = np.zeros((self.M,), dtype=np.float32)
 
     def set_wo_dt_noise_mode(self, enabled: bool) -> None:
         self.wo_dt_noise_mode = bool(enabled)
@@ -227,11 +255,14 @@ class UAVMECEnv:
 
     def _penalty_distance(self, m: int, association: np.ndarray) -> float:
         assoc_mus = np.where(association == (m + 1))[0]
-        if len(assoc_mus) == 0:
+        return self._penalty_distance_from_assoc(m, assoc_mus)
+
+    def _penalty_distance_from_assoc(self, m: int, assoc_mus: np.ndarray) -> float:
+        if assoc_mus.size == 0:
             return 0.0
         center = np.mean(self.mu_positions[assoc_mus], axis=0)
         dist = float(np.linalg.norm(self.uav_positions[m] - center))
-        return float((1.0 / max(self.area_width, self.area_height)) * max(dist - cfg.D_TH, 0.0))
+        return float(self._dist_penalty_scale * max(dist - cfg.D_TH, 0.0))
 
     def _collision_penalties(self) -> np.ndarray:
         # Pairwise UAV distance matrix; diagonal excluded from penalty accumulation.
@@ -257,25 +288,31 @@ class UAVMECEnv:
         # MU obs: [mu_pos(2), uav_pos(2M), task_data(1), task_cpu(1), prev_edge(M)]
         mu_pos_end = 2
         uav_pos_end = 2 + self.M * 2
+        task_data_idx = uav_pos_end
         task_cpu_idx = uav_pos_end + 1
         mu_obs[:, :mu_pos_end] = np.clip(mu_obs[:, :mu_pos_end] + noise(mu_obs[:, :mu_pos_end].shape), 0.0, 1.0)
         mu_obs[:, mu_pos_end:uav_pos_end] = np.clip(
             mu_obs[:, mu_pos_end:uav_pos_end] + noise(mu_obs[:, mu_pos_end:uav_pos_end].shape), 0.0, 1.0
         )
+        mu_obs[:, task_data_idx] = np.clip(mu_obs[:, task_data_idx] + noise((self.K,)), 0.0, 1.0)
         mu_obs[:, task_cpu_idx] = np.clip(mu_obs[:, task_cpu_idx] + noise((self.K,)), 0.0, 1.0)
 
         # UAV obs: [uav_pos(2), per MU (mu_pos(2), offload(1), task_data(1), task_cpu(1)), other_uav_pos]
         uav_obs[:, :2] = np.clip(uav_obs[:, :2] + noise((self.M, 2)), 0.0, 1.0)
-        for k in range(self.K):
-            base = 2 + k * 5
-            # mu positions
-            uav_obs[:, base : base + 2] = np.clip(
-                uav_obs[:, base : base + 2] + noise((self.M, 2)),
-                0.0,
-                1.0,
-            )
-            # task cpu normalized
-            uav_obs[:, base + 4] = np.clip(uav_obs[:, base + 4] + noise((self.M,)), 0.0, 1.0)
+        per_mu_start = 2
+        per_mu_end = 2 + self.K * 5
+        per_mu_block = uav_obs[:, per_mu_start:per_mu_end].reshape(self.M, self.K, 5)
+        per_mu_block[:, :, :2] = np.clip(
+            per_mu_block[:, :, :2] + noise((self.M, self.K, 2)),
+            0.0,
+            1.0,
+        )
+        per_mu_block[:, :, 4] = np.clip(
+            per_mu_block[:, :, 4] + noise((self.M, self.K)),
+            0.0,
+            1.0,
+        )
+        uav_obs[:, per_mu_start:per_mu_end] = per_mu_block.reshape(self.M, self.K * 5)
 
         other_start = 2 + self.K * 5
         if other_start < self.uav_obs_dim:
@@ -288,35 +325,29 @@ class UAVMECEnv:
         return {"mu_obs": mu_obs, "uav_obs": uav_obs}
 
     def _get_observations(self) -> Dict[str, np.ndarray]:
-        w = max(self.area_width, 1.0)
-        h = max(self.area_height, 1.0)
-        mu_pos_norm = np.column_stack([self.mu_positions[:, 0] / w, self.mu_positions[:, 1] / h]).astype(np.float32)
-        uav_pos_norm = np.column_stack([self.uav_positions[:, 0] / w, self.uav_positions[:, 1] / h]).astype(np.float32)
-        task_data_norm = (self.task_data / max(cfg.TASK_DATA_MAX, 1e-8)).astype(np.float32)
-        task_cpu_norm = (self.task_cpu / max(cfg.TASK_CPU_CYCLES_MAX, 1e-8)).astype(np.float32)
+        mu_pos_norm = self.mu_positions / self._norm_xy
+        uav_pos_norm = self.uav_positions / self._norm_xy
+        task_data_norm = self.task_data * self._task_data_scale
+        task_cpu_norm = self.task_cpu * self._task_cpu_scale
 
         mu_obs = np.zeros((self.K, self.mu_obs_dim), dtype=np.float32)
         mu_obs[:, 0:2] = mu_pos_norm
-        mu_obs[:, 2 : 2 + self.M * 2] = np.tile(uav_pos_norm.reshape(1, -1), (self.K, 1))
+        mu_obs[:, 2 : 2 + self.M * 2] = uav_pos_norm.reshape(1, -1)
         mu_obs[:, 2 + self.M * 2] = task_data_norm
         mu_obs[:, 3 + self.M * 2] = task_cpu_norm
-        denom = cfg.TASK_DATA_MAX * cfg.TASK_CPU_CYCLES_MAX + 1e-8
-        mu_obs[:, 4 + self.M * 2 :] = (self.prev_edge_load.T / denom).astype(np.float32)
+        mu_obs[:, 4 + self.M * 2 :] = self.prev_edge_load.T * self._edge_load_scale
 
         uav_obs = np.zeros((self.M, self.uav_obs_dim), dtype=np.float32)
         uav_obs[:, 0:2] = uav_pos_norm
 
-        per_mu = np.zeros((self.M, self.K, 5), dtype=np.float32)
-        per_mu[:, :, 0:2] = mu_pos_norm[None, :, :]
-        per_mu[:, :, 2] = self.prev_offload_ratio[None, :]
-        per_mu[:, :, 3] = task_data_norm[None, :]
-        per_mu[:, :, 4] = task_cpu_norm[None, :]
-        uav_obs[:, 2 : 2 + self.K * 5] = per_mu.reshape(self.M, self.K * 5)
+        per_mu_view = uav_obs[:, 2 : 2 + self.K * 5].reshape(self.M, self.K, 5)
+        per_mu_view[:, :, 0:2] = mu_pos_norm[None, :, :]
+        per_mu_view[:, :, 2] = self.prev_offload_ratio[None, :]
+        per_mu_view[:, :, 3] = task_data_norm[None, :]
+        per_mu_view[:, :, 4] = task_cpu_norm[None, :]
 
         if self.M > 1:
-            other_uav = np.zeros((self.M, (self.M - 1) * 2), dtype=np.float32)
-            for m in range(self.M):
-                other_uav[m] = np.delete(uav_pos_norm, m, axis=0).reshape(-1)
+            other_uav = uav_pos_norm[self._other_uav_col_idx].reshape(self.M, self.M - 1, 2).reshape(self.M, -1)
             uav_obs[:, 2 + self.K * 5 :] = other_uav
 
         return self._apply_wo_dt_noise({"mu_obs": mu_obs, "uav_obs": uav_obs})
@@ -344,13 +375,17 @@ class UAVMECEnv:
         # 2) Resource allocation
         raw_bw = uav_actions[:, 2 : 2 + self.K]
         raw_cpu = uav_actions[:, 2 + self.K : 2 + 2 * self.K]
+        assoc_mus_list = [np.where(association == (m + 1))[0] for m in range(self.M)]
 
-        bandwidth_alloc = np.zeros((self.K,), dtype=np.float32)
-        cpu_alloc = np.zeros((self.K,), dtype=np.float32)
-        edge_load = np.zeros((self.M, self.K), dtype=np.float32)
+        bandwidth_alloc = self._bw_alloc_cache
+        bandwidth_alloc.fill(0.0)
+        cpu_alloc = self._cpu_alloc_cache
+        cpu_alloc.fill(0.0)
+        edge_load = self._edge_load_cache
+        edge_load.fill(0.0)
 
         for m in range(self.M):
-            assoc_mus = np.where(association == (m + 1))[0]
+            assoc_mus = assoc_mus_list[m]
             if len(assoc_mus) == 0:
                 continue
 
@@ -361,8 +396,8 @@ class UAVMECEnv:
             cpu_alloc[assoc_mus] = cpu_weights * cfg.UAV_MAX_CPU_FREQ
 
         # 3) Energy and latency
-        l_all = self.task_data.astype(np.float32)
-        c_all = self.task_cpu.astype(np.float32)
+        l_all = self.task_data
+        c_all = self.task_cpu
 
         y_loc = (1.0 - offload_ratio) * l_all * c_all
         f_est_loc = np.minimum(y_loc / cfg.TIME_SLOT, cfg.MU_MAX_CPU_FREQ)
@@ -370,17 +405,22 @@ class UAVMECEnv:
         f_actual_loc = np.maximum(f_est_loc + f_dev_loc, f_est_loc * 0.1)
 
         valid_loc = y_loc > 1e-8
-        t_loc_all = np.zeros((self.K,), dtype=np.float32)
+        t_loc_all = self._t_loc_cache
+        t_loc_all.fill(0.0)
         t_loc_all[valid_loc] = (y_loc[valid_loc] / np.maximum(f_actual_loc[valid_loc], 1e3)).astype(np.float32)
 
-        e_loc_all = np.zeros((self.K,), dtype=np.float32)
+        e_loc_all = self._e_loc_cache
+        e_loc_all.fill(0.0)
         e_loc_all[valid_loc] = (cfg.EFFECTIVE_CAPACITANCE * (f_actual_loc[valid_loc] ** 2) * y_loc[valid_loc]).astype(
             np.float32
         )
 
-        mu_energy = e_loc_all.copy()
-        t_edge_all = np.zeros((self.K,), dtype=np.float32)
-        uav_comp_energy = np.zeros((self.M,), dtype=np.float32)
+        mu_energy = self._mu_energy_cache
+        np.copyto(mu_energy, e_loc_all)
+        t_edge_all = self._t_edge_cache
+        t_edge_all.fill(0.0)
+        uav_comp_energy = self._uav_comp_cache
+        uav_comp_energy.fill(0.0)
         offload_mask = (association > 0) & (offload_ratio > 1e-8)
         offload_indices = np.where(offload_mask)[0]
         if offload_indices.size > 0:
@@ -407,45 +447,59 @@ class UAVMECEnv:
 
             mu_energy[offload_indices] += e_off.astype(np.float32)
             t_edge_all[offload_indices] = (t_off + t_ecmp).astype(np.float32)
-            np.add.at(uav_comp_energy, uav_idx, e_edge.astype(np.float32))
+            uav_comp_energy += np.bincount(uav_idx, weights=e_edge, minlength=self.M).astype(np.float32)
             edge_load[uav_idx, offload_indices] = y_edge.astype(np.float32)
 
-        uav_fly_energy = np.array([self._compute_uav_flying_energy(m) for m in range(self.M)], dtype=np.float32)
-        uav_total_energy = uav_fly_energy + uav_comp_energy
+        v = np.linalg.norm(self.uav_velocities, axis=1)
+        term1 = 0.5 * cfg.FUSELAGE_DRAG_RATIO * cfg.AIR_DENSITY * cfg.ROTOR_SOLIDITY * cfg.ROTOR_DISC_AREA * (v**3)
+        term2 = cfg.BLADE_PROFILE_POWER * (1.0 + 3.0 * v**2 / (cfg.TIP_SPEED**2))
+        v0 = cfg.MEAN_ROTOR_VELOCITY
+        inner = np.maximum(np.sqrt(1.0 + v**4 / (4.0 * v0**4)) - v**2 / (2.0 * v0**2), 0.0)
+        term3 = cfg.INDUCED_POWER * np.sqrt(inner)
+        uav_fly_energy = ((term1 + term2 + term3) * cfg.TIME_SLOT).astype(np.float32)
+        uav_total_energy = self._uav_total_cache
+        np.add(uav_fly_energy, uav_comp_energy, out=uav_total_energy)
 
         # 4) Rewards
-        n_assoc_per_uav = np.zeros((self.M,), dtype=np.float32)
-        for m in range(self.M):
-            n_assoc_per_uav[m] = max(1.0, float(np.sum(association == (m + 1))))
+        assoc_counts = np.bincount(association, minlength=self.M + 1)[1:]
+        n_assoc_per_uav = np.maximum(assoc_counts, 1.0).astype(np.float32)
 
-        mu_rewards = np.zeros((self.K,), dtype=np.float32)
-        for k in range(self.K):
-            assoc_k = int(association[k])
-            latency_penalty = self._penalty_latency(float(t_loc_all[k]), float(t_edge_all[k]))
-            r = -float(mu_energy[k]) - latency_penalty
-            if assoc_k > 0:
-                uav_idx = assoc_k - 1
-                r -= cfg.WEIGHT_FACTOR * float(uav_total_energy[uav_idx]) / n_assoc_per_uav[uav_idx]
-            mu_rewards[k] = r * cfg.REWARD_SCALE
+        latency_penalty_all = self._latency_penalty_cache
+        latency_penalty_all[:] = (
+            cfg.PENALTY_DELAY
+            * (np.maximum(t_loc_all - cfg.TIME_SLOT, 0.0) + np.maximum(t_edge_all - cfg.TIME_SLOT, 0.0))
+            / cfg.TIME_SLOT
+        )
 
-        uav_rewards = np.zeros((self.M,), dtype=np.float32)
+        mu_rewards = self._mu_rewards_cache
+        mu_rewards[:] = -mu_energy - latency_penalty_all
+        valid_assoc = association > 0
+        if np.any(valid_assoc):
+            uav_indices = association[valid_assoc] - 1
+            mu_rewards[valid_assoc] -= (
+                cfg.WEIGHT_FACTOR * uav_total_energy[uav_indices] / n_assoc_per_uav[uav_indices]
+            ).astype(np.float32)
+        mu_rewards *= cfg.REWARD_SCALE
+
+        uav_rewards = self._uav_rewards_cache
+        uav_rewards[:] = -cfg.WEIGHT_FACTOR * uav_total_energy
         collision_penalties = self._collision_penalties()
+        boundary_penalties = (cfg.PENALTY_BOUNDARY * self._boundary_violation).astype(np.float32)
+        if np.any(valid_assoc):
+            assoc_uav = association[valid_assoc] - 1
+            mu_energy_sum_per_uav = np.bincount(assoc_uav, weights=mu_energy[valid_assoc], minlength=self.M)
+            latency_sum_per_uav = np.bincount(assoc_uav, weights=latency_penalty_all[valid_assoc], minlength=self.M)
+            cooperative_penalty = (mu_energy_sum_per_uav + latency_sum_per_uav) / n_assoc_per_uav
+            uav_rewards -= cooperative_penalty.astype(np.float32)
+        uav_rewards -= boundary_penalties
+        uav_rewards -= collision_penalties
         for m in range(self.M):
-            assoc_mus = np.where(association == (m + 1))[0]
-            r = -cfg.WEIGHT_FACTOR * float(uav_total_energy[m])
-            if len(assoc_mus) > 0:
-                r -= float(np.mean(mu_energy[assoc_mus]))
-                latency_terms = [self._penalty_latency(float(t_loc_all[k]), float(t_edge_all[k])) for k in assoc_mus]
-                r -= float(np.mean(latency_terms))
-
-            r -= self._penalty_boundary(m)
-            r -= self._penalty_distance(m, association)
-            r -= float(collision_penalties[m])
-            uav_rewards[m] = r * cfg.REWARD_SCALE
+            uav_rewards[m] -= np.float32(self._penalty_distance_from_assoc(m, assoc_mus_list[m]))
+        uav_rewards *= cfg.REWARD_SCALE
 
         # 5) State update
-        self.prev_edge_load = edge_load
-        self.prev_offload_ratio = offload_ratio.copy()
+        self.prev_edge_load[:] = edge_load
+        self.prev_offload_ratio[:] = offload_ratio
         self._update_mu_mobility()
         self._generate_tasks()
         self.time_step += 1
@@ -467,10 +521,10 @@ class UAVMECEnv:
 
         max_delay = np.maximum(t_loc_all, t_edge_all)
         info = {
-            "mu_energy": mu_energy,
-            "uav_energy": uav_total_energy,
-            "uav_fly_energy": uav_fly_energy,
-            "uav_comp_energy": uav_comp_energy,
+            "mu_energy": mu_energy.copy(),
+            "uav_energy": uav_total_energy.copy(),
+            "uav_fly_energy": uav_fly_energy.copy(),
+            "uav_comp_energy": uav_comp_energy.copy(),
             "weighted_energy": weighted_energy_mu_avg,  # compatibility alias
             "weighted_energy_mu_avg": weighted_energy_mu_avg,
             "weighted_energy_mu_total": weighted_energy_mu_total,
@@ -481,20 +535,22 @@ class UAVMECEnv:
             "delay_violation_rate": float(np.mean(max_delay > cfg.TIME_SLOT)),
         }
 
-        rewards = {"mu_rewards": mu_rewards, "uav_rewards": uav_rewards}
+        rewards = {"mu_rewards": mu_rewards.copy(), "uav_rewards": uav_rewards.copy()}
         return obs, rewards, done, info
 
     def get_state(self) -> np.ndarray:
+        mu_pos_norm = self.mu_positions / self._norm_xy
+        uav_pos_norm = self.uav_positions / self._norm_xy
         state_parts = [
-            self.mu_positions[:, 0] / max(self.area_width, 1.0),
-            self.mu_positions[:, 1] / max(self.area_height, 1.0),
-            self.uav_positions[:, 0] / max(self.area_width, 1.0),
-            self.uav_positions[:, 1] / max(self.area_height, 1.0),
-            self.uav_velocities.flatten() / max(cfg.UAV_MAX_VELOCITY, 1e-8),
-            self.task_data / max(cfg.TASK_DATA_MAX, 1e-8),
-            self.task_cpu / max(cfg.TASK_CPU_CYCLES_MAX, 1e-8),
+            mu_pos_norm[:, 0],
+            mu_pos_norm[:, 1],
+            uav_pos_norm[:, 0],
+            uav_pos_norm[:, 1],
+            self.uav_velocities.reshape(-1) * self._uav_velocity_scale,
+            self.task_data * self._task_data_scale,
+            self.task_cpu * self._task_cpu_scale,
         ]
-        return np.concatenate(state_parts).astype(np.float32)
+        return np.concatenate(state_parts)
 
     @property
     def state_dim(self) -> int:

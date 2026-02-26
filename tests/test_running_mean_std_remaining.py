@@ -12,6 +12,12 @@ class TestRunningMeanStdRemaining(unittest.TestCase):
         rms.update(np.array([1.0, 2.0, 3.0], dtype=np.float32))
         self.assertAlmostEqual(float(rms.count), before + 1.0, places=6)
 
+    def test_vector_reward_step_update_ignores_cross_agent_variance(self):
+        rms = RunningMeanStd()
+        rms.update(np.array([1.0, 3.0], dtype=np.float32))
+        # Per-step update should not treat across-agent spread as batch variance.
+        self.assertLess(float(rms.var), 0.01)
+
 
 if __name__ == "__main__":
     unittest.main()

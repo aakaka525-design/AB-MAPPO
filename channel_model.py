@@ -6,6 +6,57 @@ AB-MAPPO 论文复现 — 信道与通信模型
 import numpy as np
 import config as cfg
 
+try:
+    from numba import njit
+except Exception:  # pragma: no cover - optional acceleration path
+    njit = None
+
+
+_UAV_HEIGHT = float(cfg.UAV_HEIGHT)
+_ENV_A = float(cfg.ENV_PARAM_A)
+_ENV_B = float(cfg.ENV_PARAM_B)
+_CH_GAIN = float(cfg.CHANNEL_POWER_GAIN)
+_NLOS_ATT = float(cfg.NLOS_ATTENUATION)
+_PATH_LOSS = float(cfg.PATH_LOSS_EXP)
+_MU_TX_PWR = float(cfg.MU_TRANSMIT_POWER)
+_NOISE_DENS = float(cfg.NOISE_POWER_DENSITY)
+
+
+if njit is not None:
+    @njit(cache=True, fastmath=True)
+    def _compute_mu_uav_rate_batch_jit(mu_pos, uav_pos, bandwidths):
+        n = mu_pos.shape[0]
+        dims = mu_pos.shape[1]
+        rates = np.empty((n,), dtype=np.float32)
+        for i in range(n):
+            bw = bandwidths[i]
+            if bw < 1e-3:
+                bw = 1e-3
+
+            dx = mu_pos[i, 0] - uav_pos[i, 0]
+            dy = mu_pos[i, 1] - uav_pos[i, 1]
+            horiz_dist_sq = dx * dx + dy * dy
+            horiz_dist = np.sqrt(horiz_dist_sq)
+            if horiz_dist < 1e-6:
+                horiz_dist = 1e-6
+
+            if dims == 2:
+                dist_3d = np.sqrt(horiz_dist_sq + _UAV_HEIGHT * _UAV_HEIGHT)
+            else:
+                dz = mu_pos[i, 2] - uav_pos[i, 2]
+                dist_3d = np.sqrt(horiz_dist_sq + dz * dz)
+            if dist_3d < 1.0:
+                dist_3d = 1.0
+
+            elev_angle = np.arctan(_UAV_HEIGHT / horiz_dist) * (180.0 / np.pi)
+            p_los = 1.0 / (1.0 + _ENV_A * np.exp(-_ENV_B * (elev_angle - _ENV_A)))
+            gain = _CH_GAIN * (p_los + _NLOS_ATT * (1.0 - p_los)) / (dist_3d ** _PATH_LOSS)
+            snr = _MU_TX_PWR * gain / (bw * _NOISE_DENS)
+            rates[i] = bw * np.log2(1.0 + snr)
+        return rates
+else:
+    _compute_mu_uav_rate_batch_jit = None
+
 
 def compute_elevation_angle(mu_pos, uav_pos):
     """
@@ -114,8 +165,9 @@ def compute_mu_uav_rate_batch(mu_positions, uav_positions, bandwidths):
         raise ValueError(
             f"bandwidths shape mismatch: expected ({mu_positions.shape[0]},), got {bandwidths.shape}"
         )
-
-    return compute_mu_uav_rate(mu_positions, uav_positions, bandwidths)
+    if _compute_mu_uav_rate_batch_jit is not None:
+        return _compute_mu_uav_rate_batch_jit(mu_positions, uav_positions, bandwidths)
+    return compute_mu_uav_rate(mu_positions, uav_positions, bandwidths).astype(np.float32, copy=False)
 
 
 def compute_uav_bs_rate(uav_pos):

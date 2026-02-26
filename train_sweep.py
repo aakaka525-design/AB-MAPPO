@@ -65,6 +65,174 @@ class RunOptions:
     smoke: bool
 
 
+def _build_run_specs_for_setting(fig, algorithm, setting_name, base_kwargs, options: RunOptions):
+    specs = []
+    fig_dir = "base" if fig == "base" else f"fig{fig}"
+    num_mus = int(base_kwargs.get("num_mus", cfg.NUM_MUS))
+    num_uavs = int(base_kwargs.get("num_uavs", cfg.NUM_UAVS))
+    for seed in options.seeds:
+        run_dir = os.path.join(cfg.EXPERIMENT_ROOT, fig_dir, algorithm, setting_name, f"seed_{seed}")
+        summary_path = os.path.join(run_dir, "summary.json")
+        specs.append(
+            {
+                "fig": fig,
+                "fig_dir": fig_dir,
+                "algorithm": algorithm,
+                "setting_name": setting_name,
+                "seed": int(seed),
+                "run_dir": run_dir,
+                "summary_path": summary_path,
+                "cli_overrides": dict(base_kwargs),
+                "num_mus": num_mus,
+                "num_uavs": num_uavs,
+            }
+        )
+    return specs
+
+
+def build_run_specs(fig, options: RunOptions):
+    runners = {
+        "base": _build_specs_base,
+        "6": _build_specs_fig6,
+        "7": _build_specs_fig7,
+        "8": _build_specs_fig8,
+        "9": _build_specs_fig9,
+        "10": _build_specs_fig10,
+        "11": _build_specs_fig11,
+        "12": _build_specs_fig12,
+    }
+    targets = list(runners.keys()) if fig == "all" else [fig]
+    specs = []
+    for target in targets:
+        if target not in runners:
+            raise ValueError(f"Unsupported fig selector: {target}")
+        specs.extend(runners[target](options))
+    return specs
+
+
+def _build_specs_base(options: RunOptions):
+    specs = []
+    for algo in cfg.CONVERGENCE_ALGOS:
+        setting_name = f"K{cfg.NUM_MUS}_M{cfg.NUM_UAVS}"
+        kwargs = {"num_mus": cfg.NUM_MUS, "num_uavs": cfg.NUM_UAVS}
+        specs.extend(_build_run_specs_for_setting("base", algo, setting_name, kwargs, options))
+    return specs
+
+
+def _build_specs_fig6(options: RunOptions):
+    spec = cfg.clone_figure_sweeps()["fig6"]
+    xs = spec["x_values"] if not options.smoke else _values_for_smoke(spec["x_values"])
+    specs = []
+    for algo in spec["algorithms"]:
+        for x in xs:
+            setting_name = f"K{_fmt_value(x)}_M{spec['fixed']['num_uavs']}"
+            kwargs = {"num_mus": int(x), "num_uavs": int(spec["fixed"]["num_uavs"])}
+            specs.extend(_build_run_specs_for_setting("6", algo, setting_name, kwargs, options))
+    return specs
+
+
+def _build_specs_fig7(options: RunOptions):
+    spec = cfg.clone_figure_sweeps()["fig7"]
+    xs = spec["x_values"] if not options.smoke else _values_for_smoke(spec["x_values"])
+    specs = []
+    for algo in spec["algorithms"]:
+        for x in xs:
+            setting_name = f"K{spec['fixed']['num_mus']}_M{_fmt_value(x)}"
+            kwargs = {"num_mus": int(spec["fixed"]["num_mus"]), "num_uavs": int(x)}
+            specs.extend(_build_run_specs_for_setting("7", algo, setting_name, kwargs, options))
+    return specs
+
+
+def _build_specs_fig8(options: RunOptions):
+    spec = cfg.clone_figure_sweeps()["fig8"]
+    xs = spec["x_values"] if not options.smoke else _values_for_smoke(spec["x_values"])
+    specs = []
+    for algo in spec["algorithms"]:
+        for x in xs:
+            setting_name = f"K{spec['fixed']['num_mus']}_M{spec['fixed']['num_uavs']}_BW{_fmt_value(x)}"
+            kwargs = {
+                "num_mus": int(spec["fixed"]["num_mus"]),
+                "num_uavs": int(spec["fixed"]["num_uavs"]),
+                "bandwidth_mhz": float(x),
+            }
+            specs.extend(_build_run_specs_for_setting("8", algo, setting_name, kwargs, options))
+    return specs
+
+
+def _build_specs_fig9(options: RunOptions):
+    spec = cfg.clone_figure_sweeps()["fig9"]
+    xs = spec["x_values"] if not options.smoke else _values_for_smoke(spec["x_values"])
+    specs = []
+    for x in xs:
+        setting_name = f"K{spec['fixed']['num_mus']}_M{spec['fixed']['num_uavs']}_w{_fmt_value(x)}"
+        kwargs = {
+            "num_mus": int(spec["fixed"]["num_mus"]),
+            "num_uavs": int(spec["fixed"]["num_uavs"]),
+            "weight_factor": float(x),
+        }
+        specs.extend(_build_run_specs_for_setting("9", "AB-MAPPO", setting_name, kwargs, options))
+    return specs
+
+
+def _build_specs_fig10(options: RunOptions):
+    spec = cfg.clone_figure_sweeps()["fig10"]
+    ks = spec["fixed"]["ks"] if not options.smoke else _values_for_smoke(spec["fixed"]["ks"])
+    mu_cpus = spec["mu_cpu_ghz"] if not options.smoke else _values_for_smoke(spec["mu_cpu_ghz"])
+    uav_cpus = spec["uav_cpu_ghz"] if not options.smoke else _values_for_smoke(spec["uav_cpu_ghz"])
+
+    specs = []
+    for k in ks:
+        for cpu in mu_cpus:
+            setting_name = f"K{k}_M{spec['fixed']['num_uavs']}_muCPU{_fmt_value(cpu)}"
+            kwargs = {"num_mus": int(k), "num_uavs": int(spec["fixed"]["num_uavs"]), "mu_max_cpu_ghz": float(cpu)}
+            specs.extend(_build_run_specs_for_setting("10", "AB-MAPPO", setting_name, kwargs, options))
+
+    for k in ks:
+        for cpu in uav_cpus:
+            setting_name = f"K{k}_M{spec['fixed']['num_uavs']}_uavCPU{_fmt_value(cpu)}"
+            kwargs = {"num_mus": int(k), "num_uavs": int(spec["fixed"]["num_uavs"]), "uav_max_cpu_ghz": float(cpu)}
+            specs.extend(_build_run_specs_for_setting("10", "AB-MAPPO", setting_name, kwargs, options))
+    return specs
+
+
+def _build_specs_fig11(options: RunOptions):
+    spec = cfg.clone_figure_sweeps()["fig11"]
+    ks = spec["fixed"]["ks"] if not options.smoke else _values_for_smoke(spec["fixed"]["ks"])
+    dts = spec["dt_values"] if not options.smoke else _values_for_smoke(spec["dt_values"])
+    specs = []
+    for k in ks:
+        for dt in dts:
+            setting_name = f"K{k}_M{spec['fixed']['num_uavs']}_dt{_fmt_value(dt)}"
+            kwargs = {"num_mus": int(k), "num_uavs": int(spec["fixed"]["num_uavs"]), "dt_deviation": float(dt)}
+            specs.extend(_build_run_specs_for_setting("11", "AB-MAPPO", setting_name, kwargs, options))
+    return specs
+
+
+def _build_specs_fig12(options: RunOptions):
+    spec = cfg.clone_figure_sweeps()["fig12"]
+    dmaxs = spec["task_max_mbits"] if not options.smoke else _values_for_smoke(spec["task_max_mbits"])
+    bws = spec["bandwidth_mhz"] if not options.smoke else _values_for_smoke(spec["bandwidth_mhz"])
+    specs = []
+    for bw in bws:
+        for use_wo_dt in (False, True):
+            for dmax in dmaxs:
+                setting_name = (
+                    f"K{spec['fixed']['num_mus']}_M{spec['fixed']['num_uavs']}_BW{_fmt_value(bw)}_"
+                    f"Dmax{_fmt_value(dmax)}_{'woDT' if use_wo_dt else 'withDT'}"
+                )
+                kwargs = {
+                    "num_mus": int(spec["fixed"]["num_mus"]),
+                    "num_uavs": int(spec["fixed"]["num_uavs"]),
+                    "bandwidth_mhz": float(bw),
+                    "task_data_min_mbits": 0.5,
+                    "task_data_max_mbits": float(dmax),
+                    "wo_dt_noise_mode": bool(use_wo_dt),
+                    "dt_deviation": 0.0,
+                }
+                specs.extend(_build_run_specs_for_setting("12", "AB-MAPPO", setting_name, kwargs, options))
+    return specs
+
+
 def _run_one(fig, algorithm, setting_name, base_kwargs, options: RunOptions):
     seed_results = []
     for seed in options.seeds:
