@@ -23,7 +23,7 @@ from train_sweep import RunOptions, build_run_specs
 FULL_SEEDS = "42,43,44"
 FULL_TOTAL_STEPS = 80000
 FULL_EPISODE_LENGTH = 300
-CUDA_PARALLEL_HARD_CAP = 16
+CUDA_PARALLEL_HARD_CAP = 12
 CUDA_RESERVE_GB = 1.5
 CUDA_MEM_PER_JOB_GB = 0.35
 CUDA_OOM_KEYWORDS = (
@@ -263,8 +263,11 @@ def _read_log_tail(log_path, max_bytes=65536):
         return ""
 
 
-def _is_cuda_oom_failure(error_text):
+def _is_oom_failure(error_text):
     combined = str(error_text).lower()
+    # Linux OOM killer sends SIGKILL (-9)
+    if "failed with code -9" in combined:
+        return True
     log_path = _extract_log_path(error_text)
     if log_path:
         combined += "\n" + _read_log_tail(log_path).lower()
@@ -403,13 +406,13 @@ def run_full(max_parallel=3, full_device="cpu", job_timeout_sec=0.0):
             )
             break
         except RuntimeError as exc:
-            if _is_cuda_device(full_device) and effective_parallel > 1 and _is_cuda_oom_failure(str(exc)):
+            if effective_parallel > 1 and _is_oom_failure(str(exc)):
                 next_parallel = max(1, effective_parallel // 2)
                 if next_parallel == effective_parallel:
                     next_parallel = max(1, effective_parallel - 1)
                 forced_parallel = next_parallel
                 print(
-                    f"[full][retry] CUDA OOM detected, reducing parallel "
+                    f"[full][retry] OOM detected (code -9 or CUDA OOM), reducing parallel "
                     f"{effective_parallel} -> {forced_parallel}"
                 )
                 continue
