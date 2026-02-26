@@ -9,7 +9,9 @@ from __future__ import annotations
 import argparse
 from datetime import datetime
 import json
+import math
 import os
+import re
 import subprocess
 import sys
 import time
@@ -21,6 +23,14 @@ from train_sweep import RunOptions, build_run_specs
 FULL_SEEDS = "42,43,44"
 FULL_TOTAL_STEPS = 80000
 FULL_EPISODE_LENGTH = 300
+CUDA_PARALLEL_HARD_CAP = 16
+CUDA_RESERVE_GB = 1.5
+CUDA_MEM_PER_JOB_GB = 0.35
+CUDA_OOM_KEYWORDS = (
+    "cuda out of memory",
+    "cuda error: out of memory",
+    "cublas_status_alloc_failed",
+)
 
 
 def _run(cmd):
@@ -183,8 +193,82 @@ def _is_cuda_device(device):
     return "cuda" in str(device).lower()
 
 
+def _resolve_cuda_device_for_query(full_device):
+    device_str = str(full_device).lower()
+    if ":" in device_str:
+        suffix = device_str.split(":", 1)[1].strip()
+        if suffix.isdigit():
+            return int(suffix)
+    return None
+
+
+def _estimate_cuda_parallel(max_parallel, full_device):
+    try:
+        import torch
+    except Exception:
+        return 1, None, None
+
+    try:
+        if not torch.cuda.is_available():
+            return 1, None, None
+
+        device_idx = _resolve_cuda_device_for_query(full_device)
+        if device_idx is None:
+            free_bytes, total_bytes = torch.cuda.mem_get_info()
+        else:
+            free_bytes, total_bytes = torch.cuda.mem_get_info(device_idx)
+
+        free_gb = float(free_bytes) / float(1024**3)
+        total_gb = float(total_bytes) / float(1024**3)
+        available_gb = max(0.0, free_gb - float(CUDA_RESERVE_GB))
+        mem_jobs = int(math.floor(available_gb / float(CUDA_MEM_PER_JOB_GB)))
+        effective = max(
+            1,
+            min(
+                int(max_parallel),
+                int(CUDA_PARALLEL_HARD_CAP),
+                mem_jobs,
+            ),
+        )
+        return effective, free_gb, total_gb
+    except Exception:
+        return 1, None, None
+
+
 def _effective_parallel(max_parallel, full_device):
-    return 1 if _is_cuda_device(full_device) else max(1, int(max_parallel))
+    if _is_cuda_device(full_device):
+        effective, _, _ = _estimate_cuda_parallel(max_parallel, full_device)
+        return effective
+    return max(1, int(max_parallel))
+
+
+def _extract_log_path(error_text):
+    match = re.search(r"log=([^\s]+)", str(error_text))
+    if not match:
+        return None
+    return match.group(1)
+
+
+def _read_log_tail(log_path, max_bytes=65536):
+    if not log_path or not os.path.exists(log_path):
+        return ""
+    try:
+        with open(log_path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            seek_pos = max(0, size - max_bytes)
+            f.seek(seek_pos, os.SEEK_SET)
+            return f.read().decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
+
+
+def _is_cuda_oom_failure(error_text):
+    combined = str(error_text).lower()
+    log_path = _extract_log_path(error_text)
+    if log_path:
+        combined += "\n" + _read_log_tail(log_path).lower()
+    return any(keyword in combined for keyword in CUDA_OOM_KEYWORDS)
 
 
 def _summary_matches(summary_path, total_steps, episode_length):
@@ -271,31 +355,65 @@ def _build_run_job_specs(full_device, total_steps, episode_length):
 
 def run_full(max_parallel=3, full_device="cpu", job_timeout_sec=0.0):
     log_dir = _build_full_log_dir("run_logs")
-    effective_parallel = _effective_parallel(max_parallel, full_device)
     cpu_count = os.cpu_count() or 1
-    threads_per_proc = max(1, cpu_count // max(1, effective_parallel))
-    job_specs = _build_run_job_specs(
-        full_device=full_device,
-        total_steps=FULL_TOTAL_STEPS,
-        episode_length=FULL_EPISODE_LENGTH,
-    )
+    forced_parallel = None
+    attempt = 0
 
     print("[run_logs]", log_dir)
-    print(
-        f"[full] device={full_device} requested_parallel={max_parallel} "
-        f"effective_parallel={effective_parallel} threads_per_proc={threads_per_proc} "
-        f"pending_jobs={len(job_specs)}"
-    )
-    if job_specs:
-        _run_parallel_commands(
-            job_specs,
-            max_parallel=effective_parallel,
-            log_dir=log_dir,
-            job_timeout_sec=job_timeout_sec,
-            threads_per_proc=threads_per_proc,
+    while True:
+        attempt += 1
+
+        if _is_cuda_device(full_device):
+            suggested_parallel, gpu_free_gb, gpu_total_gb = _estimate_cuda_parallel(max_parallel, full_device)
+            if forced_parallel is None:
+                effective_parallel = suggested_parallel
+            else:
+                effective_parallel = max(1, min(suggested_parallel, forced_parallel))
+        else:
+            effective_parallel = _effective_parallel(max_parallel, full_device)
+            gpu_free_gb = None
+            gpu_total_gb = None
+
+        threads_per_proc = max(1, cpu_count // max(1, effective_parallel))
+        job_specs = _build_run_job_specs(
+            full_device=full_device,
+            total_steps=FULL_TOTAL_STEPS,
+            episode_length=FULL_EPISODE_LENGTH,
         )
-    else:
-        print("[full] no pending training jobs, continue to aggregation")
+
+        gpu_free_text = f"{gpu_free_gb:.2f}" if gpu_free_gb is not None else "n/a"
+        gpu_total_text = f"{gpu_total_gb:.2f}" if gpu_total_gb is not None else "n/a"
+        print(
+            f"[full] attempt={attempt} device={full_device} requested_parallel={max_parallel} "
+            f"effective_parallel={effective_parallel} threads_per_proc={threads_per_proc} "
+            f"pending_jobs={len(job_specs)} gpu_free_gb={gpu_free_text} gpu_total_gb={gpu_total_text}"
+        )
+
+        if not job_specs:
+            print("[full] no pending training jobs, continue to aggregation")
+            break
+
+        try:
+            _run_parallel_commands(
+                job_specs,
+                max_parallel=effective_parallel,
+                log_dir=log_dir,
+                job_timeout_sec=job_timeout_sec,
+                threads_per_proc=threads_per_proc,
+            )
+            break
+        except RuntimeError as exc:
+            if _is_cuda_device(full_device) and effective_parallel > 1 and _is_cuda_oom_failure(str(exc)):
+                next_parallel = max(1, effective_parallel // 2)
+                if next_parallel == effective_parallel:
+                    next_parallel = max(1, effective_parallel - 1)
+                forced_parallel = next_parallel
+                print(
+                    f"[full][retry] CUDA OOM detected, reducing parallel "
+                    f"{effective_parallel} -> {forced_parallel}"
+                )
+                continue
+            raise
 
     _run(
         [

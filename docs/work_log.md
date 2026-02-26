@@ -327,3 +327,57 @@
   - 运行确认（本机 CPU 短基准，2400 steps）：
     - `AB-MAPPO` 末轮 `eps/s`：`0.60 / 0.61`。
     - 当前 `.venv` 下 `numba_jit_enabled=False`（未安装 numba，自动回退 numpy 路径，功能正常）。
+
+- 第十五轮（RunAll CUDA 自适应并行 + OOM 退避）完成：
+  - `run_all.py`
+    - 新增 CUDA 并行估算常量：
+      - `CUDA_PARALLEL_HARD_CAP=8`
+      - `CUDA_RESERVE_GB=2.0`
+      - `CUDA_MEM_PER_JOB_GB=1.6`
+    - 新增 `_estimate_cuda_parallel(max_parallel, full_device)`：
+      - 使用 `torch.cuda.mem_get_info()` 读取显存空闲/总量；
+      - 按 `(free_gb - reserve_gb) / mem_per_job_gb` 估算并发；
+      - 与 `max_parallel`、硬上限 `8` 共同裁剪，异常时回退 `1`。
+    - `_effective_parallel()` 改为 CUDA 路径调用显存估算，CPU 路径保持原逻辑。
+    - 新增 OOM 检测链路：
+      - `_extract_log_path` / `_read_log_tail` / `_is_cuda_oom_failure`
+      - 匹配关键字：`cuda out of memory`、`cuda error: out of memory`、`cublas_status_alloc_failed`。
+    - `run_full()` 增加重试循环：
+      - CUDA 且命中 OOM 时按 `8 -> 4 -> 2 -> 1` 降并发重试；
+      - 每次重试重新构建待跑队列，自动跳过已完成 `summary.json` 的 run。
+    - `run_full()` 新增运行日志字段：
+      - `gpu_free_gb`、`gpu_total_gb`、`effective_parallel`、`threads_per_proc`（含 `attempt`）。
+  - `tests`
+    - 更新 `tests/test_run_all_run_level.py`：
+      - 删除“CUDA 强制单并行”断言；
+      - 改为“CUDA 自适应并发”断言（mock 显存估算返回 8）。
+    - 新增 `tests/test_run_all_cuda_adaptive.py`：
+      - 高显存场景并发被 cap 到 8；
+      - 低显存场景回退到 1；
+      - OOM 日志场景触发降并发重试（8->4）。
+
+- 第十五轮验收（均在 `.venv`）：
+  - 定向：
+    - `./.venv/bin/python -m unittest tests.test_run_all_run_level tests.test_run_all_cuda_adaptive tests.test_run_all_parallel_stability -v`：9/9 通过。
+  - 全量：
+    - `./.venv/bin/python -m unittest discover -s tests -p "test_*.py" -v`：60/60 通过。
+    - `./.venv/bin/python -m pytest -q`：60 passed。
+
+- 第十六轮（CUDA 并发估算参数上调）完成：
+  - `run_all.py`
+    - 将 CUDA 并发估算常量调整为更激进配置：
+      - `CUDA_PARALLEL_HARD_CAP: 8 -> 16`
+      - `CUDA_RESERVE_GB: 2.0 -> 1.5`
+      - `CUDA_MEM_PER_JOB_GB: 1.6 -> 0.35`
+    - 保持现有 OOM 自动退避逻辑不变（触发时并发减半重试）。
+  - `tests`
+    - `tests/test_run_all_cuda_adaptive.py`
+      - 调整 hard-cap 测试输入（`max_parallel=32`），确保覆盖 cap 生效；
+      - OOM 退避期望从 `8->4` 更新为 `16->8`；
+      - 低显存回退用例输入调整为 `free_gb=1.8`（在新参数下稳定回退到 `1`）。
+    - `tests/test_run_all_run_level.py`
+      - CUDA 自适应并发断言更新为 `max_parallel=16`；
+      - 线程预算断言同步更新为 `threads_per_proc=1`（`cpu_count=24` 场景）。
+
+- 第十六轮验收（`.venv`）：
+  - `./.venv/bin/python -m unittest tests.test_run_all_run_level tests.test_run_all_cuda_adaptive tests.test_run_all_parallel_stability -v`：9/9 通过。

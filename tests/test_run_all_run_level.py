@@ -50,14 +50,16 @@ class TestRunAllRunLevel(unittest.TestCase):
 
     @mock.patch("run_all._run")
     @mock.patch("run_all._build_full_log_dir", return_value="/tmp/fake_log_dir")
+    @mock.patch("run_all._estimate_cuda_parallel", return_value=(16, 20.0, 24.0))
     @mock.patch("run_all._run_parallel_commands")
     @mock.patch("run_all._summary_matches", return_value=False)
     @mock.patch("run_all.build_run_specs")
-    def test_cuda_full_forces_single_parallel(
+    def test_cuda_full_uses_adaptive_parallel(
         self,
         mock_build_specs,
         _mock_summary,
         mock_parallel,
+        _mock_estimate,
         _mock_log_dir,
         _mock_run,
     ):
@@ -66,8 +68,8 @@ class TestRunAllRunLevel(unittest.TestCase):
             run_all.run_full(max_parallel=20, full_device="cuda", job_timeout_sec=0.0)
 
         _, kwargs = mock_parallel.call_args
-        self.assertEqual(kwargs["max_parallel"], 1)
-        self.assertEqual(kwargs["threads_per_proc"], 24)
+        self.assertEqual(kwargs["max_parallel"], 16)
+        self.assertEqual(kwargs["threads_per_proc"], 1)
 
     def test_spawn_logged_process_sets_thread_env(self):
         with tempfile.TemporaryDirectory() as td:
