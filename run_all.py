@@ -17,6 +17,7 @@ import sys
 import time
 import uuid
 
+from experiment_validator import validate_experiment_outputs
 from train_sweep import RunOptions, build_run_specs
 
 
@@ -26,6 +27,11 @@ FULL_EPISODE_LENGTH = 300
 CUDA_PARALLEL_HARD_CAP = 12
 CUDA_RESERVE_GB = 1.5
 CUDA_MEM_PER_JOB_GB = 0.35
+# CPU mode: cap parallel to leave headroom for OS and prevent OOM-kill
+CPU_RAM_RESERVE_GB = 4.0
+CPU_RAM_PER_JOB_GB = 0.8
+CPU_HEAVY_MU_THRESHOLD = 100
+CPU_HEAVY_PARALLEL_HARD_CAP = 12
 CUDA_OOM_KEYWORDS = (
     "cuda out of memory",
     "cuda error: out of memory",
@@ -107,14 +113,24 @@ def _run_parallel_commands(
     job_timeout_sec=0.0,
     poll_interval_sec=0.2,
     threads_per_proc=None,
+    heavy_parallel_limit=None,
 ):
-    pending = list(job_specs)
+    pending = [_normalize_job_spec(spec) for spec in job_specs]
     active = []
 
     while pending or active:
         while pending and len(active) < max_parallel:
-            name, cmd = pending.pop(0)
-            active.append(_spawn_logged_process(name, cmd, log_dir, threads_per_proc=threads_per_proc))
+            next_job = _pop_next_schedulable_job(pending, active, heavy_parallel_limit)
+            if next_job is None:
+                break
+            spawned = _spawn_logged_process(
+                next_job["name"],
+                next_job["cmd"],
+                log_dir,
+                threads_per_proc=threads_per_proc,
+            )
+            spawned["is_heavy"] = bool(next_job.get("is_heavy", False))
+            active.append(spawned)
 
         if not active:
             continue
@@ -235,11 +251,40 @@ def _estimate_cuda_parallel(max_parallel, full_device):
         return 1, None, None
 
 
+def _estimate_cpu_parallel(max_parallel):
+    """Estimate safe CPU parallel count from available RAM and core count."""
+    requested = max(1, int(max_parallel))
+    cpu_count = os.cpu_count() or 1
+    # Each job is single-threaded NumPy, so cap by core count
+    by_cores = cpu_count
+    free_gb = _read_mem_available_gb()
+    if free_gb is not None:
+        available_gb = max(0.0, free_gb - CPU_RAM_RESERVE_GB)
+        by_ram = int(math.floor(available_gb / CPU_RAM_PER_JOB_GB))
+        return max(1, min(requested, by_cores, by_ram)), free_gb
+    return max(1, min(requested, by_cores)), None
+
+
+def _read_mem_available_gb():
+    mem_info_path = "/proc/meminfo"
+    if not os.path.exists(mem_info_path):
+        return None
+    try:
+        with open(mem_info_path, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return float(line.split()[1]) / (1024 * 1024)
+    except Exception:
+        return None
+    return None
+
+
 def _effective_parallel(max_parallel, full_device):
     if _is_cuda_device(full_device):
         effective, _, _ = _estimate_cuda_parallel(max_parallel, full_device)
         return effective
-    return max(1, int(max_parallel))
+    effective, _ = _estimate_cpu_parallel(max_parallel)
+    return effective
 
 
 def _extract_log_path(error_text):
@@ -274,7 +319,7 @@ def _is_oom_failure(error_text):
     return any(keyword in combined for keyword in CUDA_OOM_KEYWORDS)
 
 
-def _summary_matches(summary_path, total_steps, episode_length):
+def _summary_matches(summary_path, total_steps, episode_length, paper_mode=False):
     if not os.path.exists(summary_path):
         return False
     try:
@@ -284,7 +329,11 @@ def _summary_matches(summary_path, total_steps, episode_length):
         return False
     same_steps = int(summary.get("total_steps", -1)) == int(total_steps)
     same_epl = int(summary.get("episode_length", -1)) == int(episode_length)
-    return same_steps and same_epl
+    if not (same_steps and same_epl):
+        return False
+    if paper_mode:
+        return bool(summary.get("paper_mode", False))
+    return True
 
 
 def _append_override_arg(cmd, key, value):
@@ -320,7 +369,7 @@ def _build_train_cmd_from_spec(run_spec, full_device, total_steps, episode_lengt
     return cmd
 
 
-def _build_run_job_specs(full_device, total_steps, episode_length):
+def _build_run_job_specs(full_device, total_steps, episode_length, paper_mode=False):
     options = RunOptions(
         seeds=[42, 43, 44],
         device=full_device,
@@ -330,12 +379,13 @@ def _build_run_job_specs(full_device, total_steps, episode_length):
         skip_existing=False,
         disable_tensorboard=True,
         smoke=False,
+        paper_mode=bool(paper_mode),
     )
     all_specs = build_run_specs("all", options)
     pending_specs = []
 
     for spec in all_specs:
-        if _summary_matches(spec["summary_path"], total_steps, episode_length):
+        if _summary_matches(spec["summary_path"], total_steps, episode_length, paper_mode=paper_mode):
             print(
                 f"[skip] fig={spec['fig']} algo={spec['algorithm']} "
                 f"{spec['setting_name']} seed={spec['seed']}"
@@ -352,11 +402,60 @@ def _build_run_job_specs(full_device, total_steps, episode_length):
     for spec in pending_specs:
         name = f"fig{spec['fig']}_{spec['algorithm']}_{spec['setting_name']}_seed{spec['seed']}"
         cmd = _build_train_cmd_from_spec(spec, full_device, total_steps, episode_length)
-        job_specs.append((name, cmd))
+        is_heavy = int(spec.get("num_mus", 0)) >= CPU_HEAVY_MU_THRESHOLD
+        job_specs.append((name, cmd, {"is_heavy": bool(is_heavy)}))
     return job_specs
 
 
-def run_full(max_parallel=3, full_device="cpu", job_timeout_sec=0.0):
+def _normalize_job_spec(job_spec):
+    if isinstance(job_spec, dict):
+        return {
+            "name": str(job_spec["name"]),
+            "cmd": list(job_spec["cmd"]),
+            "is_heavy": bool(job_spec.get("is_heavy", False)),
+        }
+
+    if not isinstance(job_spec, (tuple, list)):
+        raise TypeError(f"Unsupported job spec type: {type(job_spec)}")
+
+    if len(job_spec) < 2:
+        raise ValueError("Job spec tuple/list must contain at least (name, cmd)")
+
+    name = str(job_spec[0])
+    cmd = list(job_spec[1])
+    is_heavy = False
+    if len(job_spec) >= 3:
+        meta = job_spec[2]
+        if isinstance(meta, dict):
+            is_heavy = bool(meta.get("is_heavy", False))
+        else:
+            is_heavy = bool(meta)
+
+    return {"name": name, "cmd": cmd, "is_heavy": is_heavy}
+
+
+def _count_active_heavy(active_jobs):
+    return sum(1 for job in active_jobs if bool(job.get("is_heavy", False)))
+
+
+def _pop_next_schedulable_job(pending_jobs, active_jobs, heavy_parallel_limit):
+    if not pending_jobs:
+        return None
+
+    if heavy_parallel_limit is None:
+        return pending_jobs.pop(0)
+
+    heavy_limit = max(1, int(heavy_parallel_limit))
+    heavy_active = _count_active_heavy(active_jobs)
+    for idx, job in enumerate(pending_jobs):
+        if not job.get("is_heavy", False):
+            return pending_jobs.pop(idx)
+        if heavy_active < heavy_limit:
+            return pending_jobs.pop(idx)
+    return None
+
+
+def run_full(max_parallel=3, full_device="cpu", job_timeout_sec=0.0, paper_mode=False):
     log_dir = _build_full_log_dir("run_logs")
     cpu_count = os.cpu_count() or 1
     forced_parallel = None
@@ -368,28 +467,40 @@ def run_full(max_parallel=3, full_device="cpu", job_timeout_sec=0.0):
 
         if _is_cuda_device(full_device):
             suggested_parallel, gpu_free_gb, gpu_total_gb = _estimate_cuda_parallel(max_parallel, full_device)
+            cpu_free_gb = None
+            heavy_parallel_limit = None
             if forced_parallel is None:
                 effective_parallel = suggested_parallel
             else:
                 effective_parallel = max(1, min(suggested_parallel, forced_parallel))
+            threads_per_proc = max(1, cpu_count // max(1, effective_parallel))
         else:
-            effective_parallel = _effective_parallel(max_parallel, full_device)
+            suggested_parallel, cpu_free_gb = _estimate_cpu_parallel(max_parallel)
+            heavy_parallel_limit = max(1, min(int(CPU_HEAVY_PARALLEL_HARD_CAP), int(suggested_parallel)))
+            if forced_parallel is None:
+                effective_parallel = suggested_parallel
+            else:
+                effective_parallel = max(1, min(suggested_parallel, forced_parallel))
             gpu_free_gb = None
             gpu_total_gb = None
-
-        threads_per_proc = max(1, cpu_count // max(1, effective_parallel))
+            # CPU path is environment-step bound; force 1 thread/proc to avoid BLAS oversubscription.
+            threads_per_proc = 1
         job_specs = _build_run_job_specs(
             full_device=full_device,
             total_steps=FULL_TOTAL_STEPS,
             episode_length=FULL_EPISODE_LENGTH,
+            paper_mode=paper_mode,
         )
 
         gpu_free_text = f"{gpu_free_gb:.2f}" if gpu_free_gb is not None else "n/a"
         gpu_total_text = f"{gpu_total_gb:.2f}" if gpu_total_gb is not None else "n/a"
+        cpu_free_text = f"{cpu_free_gb:.2f}" if cpu_free_gb is not None else "n/a"
+        heavy_limit_text = str(heavy_parallel_limit) if heavy_parallel_limit is not None else "n/a"
         print(
             f"[full] attempt={attempt} device={full_device} requested_parallel={max_parallel} "
             f"effective_parallel={effective_parallel} threads_per_proc={threads_per_proc} "
-            f"pending_jobs={len(job_specs)} gpu_free_gb={gpu_free_text} gpu_total_gb={gpu_total_text}"
+            f"pending_jobs={len(job_specs)} gpu_free_gb={gpu_free_text} gpu_total_gb={gpu_total_text} "
+            f"cpu_mem_available_gb={cpu_free_text} heavy_parallel_limit={heavy_limit_text}"
         )
 
         if not job_specs:
@@ -403,6 +514,7 @@ def run_full(max_parallel=3, full_device="cpu", job_timeout_sec=0.0):
                 log_dir=log_dir,
                 job_timeout_sec=job_timeout_sec,
                 threads_per_proc=threads_per_proc,
+                heavy_parallel_limit=heavy_parallel_limit,
             )
             break
         except RuntimeError as exc:
@@ -418,25 +530,34 @@ def run_full(max_parallel=3, full_device="cpu", job_timeout_sec=0.0):
                 continue
             raise
 
-    _run(
-        [
-            sys.executable,
-            "train_sweep.py",
-            "--fig",
-            "all",
-            "--seeds",
-            FULL_SEEDS,
-            "--total_steps",
-            str(FULL_TOTAL_STEPS),
-            "--episode_length",
-            str(FULL_EPISODE_LENGTH),
-            "--resume",
-            "--skip_existing",
-            "--disable_tensorboard",
-            "--device",
-            full_device,
-        ]
+    aggregate_cmd = [
+        sys.executable,
+        "train_sweep.py",
+        "--fig",
+        "all",
+        "--seeds",
+        FULL_SEEDS,
+        "--total_steps",
+        str(FULL_TOTAL_STEPS),
+        "--episode_length",
+        str(FULL_EPISODE_LENGTH),
+        "--resume",
+        "--skip_existing",
+        "--disable_tensorboard",
+        "--device",
+        full_device,
+    ]
+    if paper_mode:
+        aggregate_cmd.append("--paper_mode")
+    _run(aggregate_cmd)
+    validate_experiment_outputs(
+        total_steps=FULL_TOTAL_STEPS,
+        episode_length=FULL_EPISODE_LENGTH,
+        seeds=[int(s.strip()) for s in str(FULL_SEEDS).split(",") if s.strip()],
+        fig="all",
+        paper_mode=bool(paper_mode),
     )
+    print("[full] experiment data validation passed")
 
     _run([sys.executable, "generate_figures.py", "--figs", "all"])
 
@@ -452,6 +573,11 @@ def parse_args():
         default=0.0,
         help="timeout per full-stage job in seconds (0 disables timeout)",
     )
+    p.add_argument(
+        "--paper_mode",
+        action="store_true",
+        help="Enable paper-aligned training preset across full-stage runs.",
+    )
     return p.parse_args()
 
 
@@ -464,6 +590,7 @@ def main():
             max_parallel=max(1, args.max_parallel),
             full_device=args.full_device,
             job_timeout_sec=max(0.0, float(args.job_timeout_sec)),
+            paper_mode=bool(args.paper_mode),
         )
     else:
         run_smoke()
@@ -471,6 +598,7 @@ def main():
             max_parallel=max(1, args.max_parallel),
             full_device=args.full_device,
             job_timeout_sec=max(0.0, float(args.job_timeout_sec)),
+            paper_mode=bool(args.paper_mode),
         )
 
 

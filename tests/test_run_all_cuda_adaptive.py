@@ -52,6 +52,7 @@ class TestRunAllCudaAdaptive(unittest.TestCase):
         self.assertIsNotNone(free_gb)
         self.assertIsNotNone(total_gb)
 
+    @mock.patch("run_all.validate_experiment_outputs")
     @mock.patch("run_all._run")
     @mock.patch("run_all._estimate_cuda_parallel", return_value=(16, 10.0, 24.0))
     @mock.patch("run_all._build_run_job_specs")
@@ -62,6 +63,7 @@ class TestRunAllCudaAdaptive(unittest.TestCase):
         mock_build_jobs,
         _mock_estimate,
         _mock_run,
+        _mock_validate_outputs,
     ):
         with tempfile.TemporaryDirectory() as td:
             oom_log = os.path.join(td, "oom.log")

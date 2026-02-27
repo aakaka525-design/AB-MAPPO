@@ -381,3 +381,366 @@
 
 - 第十六轮验收（`.venv`）：
   - `./.venv/bin/python -m unittest tests.test_run_all_run_level tests.test_run_all_cuda_adaptive tests.test_run_all_parallel_stability -v`：9/9 通过。
+
+- 第十七轮（CPU 并行调度优化：单线程 + 内存感知 + 重任务限流）完成：
+  - `run_all.py`
+    - CPU 路径线程策略：
+      - `run_full()` 在 `full-device=cpu` 时固定 `threads_per_proc=1`，避免 NumPy/BLAS 过订阅导致的吞吐下降。
+    - 内存感知并发估算：
+      - 新增 `_read_mem_available_gb()` 读取 `/proc/meminfo` 的 `MemAvailable`；
+      - `_estimate_cpu_parallel()` 改为按 `min(max_parallel, cpu_count, by_ram)` 估算，其中
+        `by_ram = floor((MemAvailable - CPU_RAM_RESERVE_GB) / CPU_RAM_PER_JOB_GB)`。
+    - 重任务（大 `K`）限流：
+      - 新增 `CPU_HEAVY_MU_THRESHOLD=100`、`CPU_HEAVY_PARALLEL_HARD_CAP=12`；
+      - `job_specs` 增加 `is_heavy` 元信息（`num_mus >= 100`）；
+      - `_run_parallel_commands()` 新增 `heavy_parallel_limit` 调度约束，限制重任务并发槽位，轻任务可穿插执行。
+    - 调度器可测试化改造：
+      - 新增 `_normalize_job_spec`、`_count_active_heavy`、`_pop_next_schedulable_job`。
+    - 运行日志新增 CPU 观测字段：
+      - `cpu_mem_available_gb`、`heavy_parallel_limit`。
+  - `tests`
+    - 更新 `tests/test_run_all_run_level.py`：
+      - CPU 路径断言 `threads_per_proc=1`；
+      - 断言 `heavy_parallel_limit` 按新策略传入。
+    - 新增 `tests/test_run_all_cpu_strategy.py`：
+      - CPU 并发估算（核心上限 / 低内存回退）；
+      - 重任务限流选择器行为（优先轻任务 / 全重任务阻塞返回 `None`）。
+
+- 第十七轮验收（`.venv`）：
+  - 定向：
+    - `./.venv/bin/python -m unittest tests.test_run_all_run_level tests.test_run_all_cpu_strategy tests.test_run_all_cuda_adaptive tests.test_run_all_parallel_stability -v`：13/13 通过。
+  - 全量：
+    - `./.venv/bin/python -m unittest discover -s tests -p "test_*.py" -v`：64/64 通过。
+    - `./.venv/bin/python -m pytest -q`：64 passed。
+
+- 第十八轮（论文对齐优化阶段一 + 模块源码文档同步）完成：
+  - `config.py`
+    - 新增默认开关常量：
+      - `UAV_OBS_MASK_MODE = "none"`
+      - `NORMALIZE_REWARD = True`
+  - `train.py`
+    - 新增 CLI 参数：
+      - `--normalize_reward {on,off}`（默认 `on`）
+      - `--reward_scale <float>`（默认 `cfg.REWARD_SCALE`）
+      - `--uav_obs_mask_mode {none,prev_assoc}`（默认 `none`）
+    - `_build_cfg_overrides()` 新增 `REWARD_SCALE` 覆盖。
+    - 训练装配链路打通：
+      - 环境构造透传 `uav_obs_mask_mode`；
+      - agent 构造透传 `normalize_reward`。
+    - `summary.json` 新增记录字段：
+      - `normalize_reward`、`reward_scale`、`uav_obs_mask_mode`。
+    - `namespace_from_kwargs()` 同步新增默认字段，保证 `train_sweep`/测试入口兼容。
+  - `environment.py`
+    - `UAVMECEnv.__init__` 新增 `uav_obs_mask_mode`（`none/prev_assoc`）并做参数校验。
+    - 新增 `self.prev_association` 状态（`shape=(K,)`）；
+      - `reset()` 置零；
+      - `step()` 每步写入最新 `association`。
+    - `_get_observations()` 在 `prev_assoc` 模式下对 `uav_obs` 的 per-MU 区块做关联掩码：
+      - 非关联 MU 的 5 维特征清零。
+    - Jain 公平性指标对齐论文原式：
+      - `jain_fairness = (sum(E_k)^2) / (K * sum(E_k^2) + eps)`。
+    - 保留 legacy：
+      - 新增 `info["jain_fairness_utility"]`（inverse-energy 版本）避免历史分析脚本断裂。
+  - `networks.py`
+    - `AttentionCritic` 改为异构双编码器结构：
+      - `mu_encoder`（用户观测）
+      - `uav_encoder`（UAV 观测）
+    - 构建并注册 `attn_bias`（对角线 `-inf`）；
+      - `scaled_dot_product_attention` 路径传入 `attn_mask=attn_bias`；
+      - fallback 路径 `attn_scores += attn_bias` 后 `softmax`。
+    - 显式实现 `j != i` 的注意力屏蔽，去除自注意力。
+  - `mappo.py`
+    - `ABMAPPO.__init__` 新增 `normalize_reward: bool`。
+    - 注意力 critic 实例化改为传入：
+      - `num_mus/num_uavs/mu_obs_dim/uav_obs_dim`。
+    - `collect_episode()` 奖励路径增加兼容开关：
+      - `normalize_reward=on`：保持 RMS 归一化；
+      - `normalize_reward=off`：直接使用 raw reward。
+  - `scripts/generate_current_modules_code.py`
+    - 新增可重复生成脚本：
+      - 收集仓库内非 `tests` 的 `.py`；
+      - 按路径排序；
+      - 生成 `docs/current_modules_code.md`。
+
+- 第十八轮测试补充（TDD：先红后绿）：
+  - 修改 `tests/test_environment_metrics.py`
+    - 将 Jain 断言改为论文原式；
+    - 新增 legacy 指标字段断言 `jain_fairness_utility`。
+  - 新增 `tests/test_attention_critic_mask_and_encoders.py`
+    - 校验 `AttentionCritic` 具备双 encoder；
+    - 通过 patch SDPA 捕获并断言对角 `attn_mask` 为 `-inf`。
+  - 新增 `tests/test_environment_uav_obs_mask_mode.py`
+    - `prev_assoc`：非关联 MU 特征应清零；
+    - `none`：保持全量 MU 特征。
+  - 新增 `tests/test_train_cli_paper_flags.py`
+    - 校验新 CLI 参数解析；
+    - 校验 `train()` 透传参数并写入 `summary.json`。
+
+- 第十八轮验收（`.venv`）：
+  - 定向：
+    - `./.venv/bin/python -m unittest tests.test_environment_metrics tests.test_attention_critic_mask_and_encoders tests.test_environment_uav_obs_mask_mode tests.test_train_cli_paper_flags -v`：14/14 通过。
+  - 全量：
+    - `./.venv/bin/python -m unittest discover -s tests -p "test_*.py" -v`：71/71 通过。
+    - `./.venv/bin/python -m pytest -q`：71 passed。
+  - 训练烟测：
+    - `./.venv/bin/python train.py --algorithm AB-MAPPO --total_steps 600 --episode_length 300 --device cpu --disable_tensorboard --uav_obs_mask_mode prev_assoc --run_dir /tmp/ab_mappo_stage1_smoke_prev_assoc`：通过。
+    - `./.venv/bin/python train.py --algorithm AB-MAPPO --total_steps 600 --episode_length 300 --device cpu --disable_tensorboard --normalize_reward off --reward_scale 1.0 --run_dir /tmp/ab_mappo_stage1_smoke_raw_reward`：通过。
+
+- 第十九轮（阶段二核心功能推进：BS中继/运动学/Critic/rollout语义）完成：
+  - `environment.py`
+    - MU 动作离散维度扩展为 `M+2`：
+      - `0`=本地计算，`1..M`=直接卸载到 UAV，`M+1`=经 UAV 中继到 BS。
+    - `step()` 新增 BS 中继路径：
+      - 为 `association == M+1` 的 MU 选择最近 UAV 作为 relay；
+      - 计算 MU→UAV 一跳速率（`compute_mu_uav_rate_batch`）与 UAV→BS 二跳速率（`compute_uav_bs_rate`）；
+      - 累加 MU 发射能耗、二跳时延、UAV 中继发射能耗；
+      - 中继任务映射到 relay UAV 参与协同惩罚分摊。
+    - UAV 位置更新引入论文式加速度位移项：
+      - `q[n+1] = q[n] + v[n]Δt + 0.5*a[n]Δt^2`；
+      - 速度仍保持最大加速度与最大速度双约束。
+    - `prev_association` 更新为“有效 UAV 关联”（含 BS 中继映射到 relay UAV），与 `prev_assoc` 观测掩码语义保持一致。
+  - `networks.py`
+    - `MLPCritic` 输出维度由标量改为 `num_agents`（当传入 `num_agents` 时）。
+  - `mappo.py`
+    - `ABMAPPO` 新增 `rollout_mode`：
+      - `fixed`（默认）：保持 300-step 跨 episode rollout；
+      - `env_episode`：一次 rollout 仅收集单个环境 episode（`env.max_steps`）。
+    - MLP critic 路径改为 per-agent value：
+      - `_values_from_state()` 返回 `[K] + [M]` 独立 value；
+      - `_update_mlp_critic()` 用 `cat(mu_returns, uav_returns)` 与 critic 输出逐 agent 对齐回归。
+    - MU association clip / 随机策略同步适配 `M+1` 的 BS 标签。
+  - `train.py`
+    - 新增 CLI：`--rollout_mode {fixed,env_episode}`（默认 `fixed`）。
+    - `_make_agent()` 透传 `rollout_mode`；
+    - `summary.json` 新增 `rollout_mode` 字段；
+    - `namespace_from_kwargs()` 新增默认 `rollout_mode`。
+  - `config.py`
+    - 新增 `ROLLOUT_MODE = "fixed"`。
+
+- 第十九轮测试补充：
+  - 新增 `tests/test_stage2_alignment_features.py`：
+    - `test_mu_discrete_dim_includes_bs_relay_choice`
+    - `test_bs_relay_path_calls_uav_bs_rate`
+    - `test_mlp_critic_outputs_per_agent_values`
+    - `test_env_episode_rollout_mode_collects_single_env_horizon`
+  - 更新 `tests/test_train_cli_paper_flags.py`：
+    - 新增 `rollout_mode` 参数解析、透传与 summary 字段断言。
+
+- 第十九轮验收（`.venv`）：
+  - 定向：
+    - `./.venv/bin/python -m unittest tests.test_stage2_alignment_features tests.test_train_cli_paper_flags tests.test_mappo_critic_state_consistency tests.test_environment_metrics tests.test_environment_remaining -v`：18/18 通过。
+  - 全量：
+    - `./.venv/bin/python -m unittest discover -s tests -p "test_*.py" -v`：75/75 通过。
+    - `./.venv/bin/python -m pytest -q`：75 passed。
+  - 训练烟测：
+    - `./.venv/bin/python train.py --algorithm AB-MAPPO --total_steps 600 --episode_length 300 --device cpu --disable_tensorboard --rollout_mode env_episode --run_dir /tmp/ab_mappo_stage2_env_episode`：通过。
+    - `./.venv/bin/python train.py --algorithm AB-MAPPO --total_steps 600 --episode_length 300 --device cpu --disable_tensorboard --rollout_mode fixed --run_dir /tmp/ab_mappo_stage2_fixed`：通过。
+
+- 第二十轮（实验数据体检 + 出图门禁）完成：
+  - 新增 `experiment_validator.py`：
+    - `validate_run_summaries(specs, total_steps, episode_length)`：
+      - 检查每个期望 run 的 `summary.json` 是否存在；
+      - 检查 `algorithm/seed/num_mus/num_uavs/total_steps/episode_length` 是否与 sweep 规格一致；
+      - 防止“缺 run”与“参数混跑”进入出图。
+    - `validate_aggregate_freshness(specs, aggregate_paths)`：
+      - 以各 fig 最新 `summary.json` 修改时间为基准；
+      - 检查 `aggregate/*.json` 是否存在且不早于对应 summary（防止 stale aggregate）；
+      - 额外校验 aggregate JSON 可解析。
+    - `validate_experiment_outputs(...)`：
+      - 使用 `build_run_specs("all", ...)` 汇总期望 run；
+      - 统一执行 run 完整性与 aggregate 新鲜度校验；
+      - 校验失败时抛 `RuntimeError` 并列出问题清单。
+  - `run_all.py`
+    - 在 full 阶段聚合命令（`train_sweep.py --fig all --resume --skip_existing`）之后、
+      `generate_figures.py` 之前，新增强制门禁：
+      - 调用 `validate_experiment_outputs(...)`；
+      - 通过后打印 `[full] experiment data validation passed`；
+      - 不通过直接终止，阻止错误数据出图。
+  - 测试更新：
+    - 新增 `tests/test_experiment_validator.py`：
+      - 覆盖缺 summary、参数不一致、aggregate 过期三类核心异常。
+    - 更新 `tests/test_run_all_run_level.py`：
+      - run_full 正常路径断言 `validate_experiment_outputs` 被调用；
+      - 新增校验失败时“阻止 generate_figures”测试。
+    - 更新 `tests/test_run_all_cuda_adaptive.py`：
+      - 适配新增门禁调用（mock `validate_experiment_outputs`）。
+
+- 第二十轮验收（`.venv`）：
+  - 定向：
+    - `./.venv/bin/python -m unittest tests.test_experiment_validator tests.test_run_all_run_level tests.test_run_all_cuda_adaptive -v`：10/10 通过。
+  - 全量：
+    - `./.venv/bin/python -m unittest discover -s tests -p "test_*.py" -v`：79/79 通过。
+    - `./.venv/bin/python -m pytest -q`：79 passed。
+
+- 第二十一轮（阶段四：BS 中继策略可配置）完成：
+  - `config.py`
+    - 新增默认常量：`BS_RELAY_POLICY = "nearest"`。
+  - `train.py`
+    - 新增 CLI 参数：`--bs_relay_policy {nearest,best_snr,min_load}`；
+    - 环境构造透传 `bs_relay_policy`；
+    - `summary.json` 新增 `bs_relay_policy` 字段；
+    - `namespace_from_kwargs()` 增加默认项，保证测试与脚本入口兼容。
+  - `environment.py`
+    - `UAVMECEnv.__init__` 新增 `bs_relay_policy` 参数与合法值校验；
+    - 新增 `_select_bs_relay_uav(...)`，支持三种策略：
+      - `nearest`：按 MU-UAV 欧氏距离最近；
+      - `best_snr`：按 MU->UAV first-hop 速率最大（等带宽评分）；
+      - `min_load`：按当前有效负载最小优先、同负载按距离打破平局。
+    - `step()` 中 BS 中继关联由固定“最近 UAV”改为策略选择结果，其他能耗/时延逻辑保持不变。
+  - 新增测试：
+    - `tests/test_bs_relay_policy.py`
+      - 非法策略应抛异常；
+      - `nearest` 映射正确；
+      - `min_load` 能均衡分配；
+      - 训练 CLI 能透传并写入 summary。
+
+- 第二十一轮验收（`.venv`）：
+  - 定向：
+    - `./.venv/bin/python -m unittest tests.test_bs_relay_policy -v`：4/4 通过。
+  - 全量：
+    - `./.venv/bin/python -m unittest discover -s tests -p "test_*.py" -v`：83/83 通过。
+    - `./.venv/bin/python -m pytest -q`：83 passed。
+
+- 第二十二轮（下阶段：paper_mode 预设链路打通）完成：
+  - 目标：
+    - 将论文对齐关键开关收敛为单一 `paper_mode` 预设，减少手工参数遗漏；
+    - 打通 `train.py -> train_sweep.py -> run_all.py -> experiment_validator.py` 全链路。
+  - `config.py`
+    - 新增默认常量：`PAPER_MODE = "off"`。
+  - `train.py`
+    - 新增 CLI 参数：`--paper_mode {on,off}`；
+    - 新增 `_apply_paper_mode_preset(args)`：
+      - `paper_mode=on` 时强制：
+        - `normalize_reward=off`
+        - `reward_scale=1.0`
+        - `uav_obs_mask_mode=prev_assoc`
+        - `rollout_mode=env_episode`
+        - `bs_relay_policy=best_snr`
+    - `summary.json` 新增字段：`paper_mode`；
+    - `namespace_from_kwargs()` 新增默认 `paper_mode`。
+  - `train_sweep.py`
+    - `RunOptions` 新增字段 `paper_mode: bool = False`；
+    - 新增 CLI 开关 `--paper_mode`；
+    - `build_run_specs` 在 `paper_mode=True` 时自动注入 `cli_overrides["paper_mode"]="on"`。
+  - `run_all.py`
+    - `run_full()` 新增参数 `paper_mode=False`，并向 run 级任务构建透传；
+    - `parse_args()` 新增 `--paper_mode`；
+    - `_summary_matches()` 新增 paper_mode 匹配条件（开启时仅复用 `summary.paper_mode=true` 的已有 run）；
+    - full 阶段聚合命令在 paper_mode 开启时自动附加 `--paper_mode`；
+    - `validate_experiment_outputs()` 调用新增 `paper_mode` 透传。
+  - `experiment_validator.py`
+    - `validate_experiment_outputs(..., paper_mode=False)` 新增参数；
+    - `paper_mode=True` 时额外校验每个 summary 的 `paper_mode` 字段必须为 true。
+  - 测试更新（TDD：先红后绿）：
+    - `tests/test_train_cli_paper_flags.py`
+      - `parse_args` 覆盖 `--paper_mode on`；
+      - 新增 `test_train_paper_mode_forces_preset_flags`。
+    - `tests/test_train_sweep_run_specs.py`
+      - 新增 `test_paper_mode_injects_cli_override`。
+    - `tests/test_run_all_run_level.py`
+      - 新增 `test_build_run_job_specs_propagates_paper_mode`。
+
+- 第二十二轮验收（`.venv`）：
+  - 定向：
+    - `./.venv/bin/python -m unittest tests.test_train_cli_paper_flags tests.test_train_sweep_run_specs tests.test_run_all_run_level -v`：10/10 通过。
+  - 全量：
+    - `./.venv/bin/python -m unittest discover -s tests -p "test_*.py" -v`：86/86 通过。
+    - `./.venv/bin/python -m pytest -q`：86 passed。
+
+- 第二十三轮（paper_mode 字段级一致性门禁）完成：
+  - 目标：
+    - 在 `paper_mode` 开启时，不只校验 `summary.paper_mode=true`，还校验关键论文配置字段一致，避免“打了 paper_mode 标签但参数不一致”的混入。
+  - `config.py`
+    - 新增 paper profile 常量：
+      - `PAPER_PROFILE_NORMALIZE_REWARD = False`
+      - `PAPER_PROFILE_REWARD_SCALE = 1.0`
+      - `PAPER_PROFILE_UAV_OBS_MASK_MODE = "prev_assoc"`
+      - `PAPER_PROFILE_ROLLOUT_MODE = "env_episode"`
+      - `PAPER_PROFILE_BS_RELAY_POLICY = "best_snr"`
+  - `train.py`
+    - `_apply_paper_mode_preset()` 改为引用上述 profile 常量，消除硬编码，确保训练预设与门禁预设同源。
+  - `experiment_validator.py`
+    - 新增 `validate_paper_profile(specs)`：
+      - 在 summary 级校验：
+        - `paper_mode`
+        - `normalize_reward`
+        - `reward_scale`（浮点容差）
+        - `uav_obs_mask_mode`
+        - `rollout_mode`
+        - `bs_relay_policy`
+    - `validate_experiment_outputs(..., paper_mode=True)` 时，新增调用 `validate_paper_profile` 并并入错误列表。
+  - 测试更新（TDD：先红后绿）：
+    - `tests/test_experiment_validator.py`
+      - 新增 `test_validate_experiment_outputs_paper_mode_requires_profile_fields`：
+        - 构造 `paper_mode=true` 但 `reward_scale` 错配样本；
+        - 断言 `validate_experiment_outputs(..., paper_mode=True)` 抛错并包含 `reward_scale` 关键词。
+
+- 第二十三轮验收（`.venv`）：
+  - 定向：
+    - `./.venv/bin/python -m unittest tests.test_experiment_validator -v`：4/4 通过。
+    - `./.venv/bin/python -m unittest tests.test_train_cli_paper_flags tests.test_train_sweep_run_specs tests.test_run_all_run_level -v`：10/10 通过。
+  - 全量：
+    - `./.venv/bin/python -m unittest discover -s tests -p "test_*.py" -v`：87/87 通过。
+    - `./.venv/bin/python -m pytest -q`：87 passed。
+
+- 第二十四轮（论文审查剩余项修复：MADDPG 维度 + 中继带宽 + 语义告警）完成：
+  - `maddpg.py`
+    - 修复 MU association 维度：
+      - `self.mu_assoc_dim: M+1 -> M+2`；
+      - 与环境离散动作空间 `{0,1,...,M,M+1}` 对齐，支持 BS relay 选项。
+  - `environment.py`
+    - 修复 BS relay 第一跳带宽分配：
+      - 原实现：relay MU 独立均分 `cfg.BANDWIDTH`；
+      - 新实现：与 direct MU 共用同一 UAV 的带宽 softmax 分配池（基于 `assoc_mus_list`）。
+    - 保留 CPU 分配仅针对 direct MU（relay 不在 UAV 侧计算）。
+    - 增加注释澄清中继路径：
+      - `uav_comp_energy` 实际累加“非飞行能耗”（direct 计算 + relay 转发发射）；
+      - BS 端计算延迟在当前论文设定下按可忽略处理。
+    - relay 路径变量名 `e_uav_bs` 改为 `e_uav_relay_tx`，降低误导。
+  - `mappo.py`
+    - 在 `_values_from_state` 的标量广播防御分支新增 `RuntimeWarning`（仅首次）：
+      - 提示 critic 输出维度配置可能异常。
+
+- 第二十四轮测试补充（TDD：先红后绿）：
+  - `tests/test_stage2_alignment_features.py`
+    - 新增 `test_maddpg_assoc_dim_matches_env_discrete_space`；
+    - 新增 `test_bs_relay_bandwidth_shares_uav_allocator_pool`（验证 relay 带宽不再独立均分）。
+  - `tests/test_mappo_fused_actions_values.py`
+    - 新增 `test_values_from_state_warns_when_scalar_critic_is_broadcast`。
+
+- 第二十四轮验收（`.venv`）：
+  - 定向：
+    - `./.venv/bin/python -m unittest tests.test_stage2_alignment_features tests.test_mappo_fused_actions_values -v`：11/11 通过。
+  - 全量：
+    - `./.venv/bin/python -m unittest discover -s tests -p "test_*.py" -v`：90/90 通过。
+    - `./.venv/bin/python -m pytest -q`：90 passed。
+
+- 第二十五轮（关键语义与训练稳定性修复）完成：
+  - 目标：收敛并修复高/中优先级剩余项（UAV 能耗双计入、rollout 计步语义、value clipping、资源 softmax 温度开关）。
+  - `environment.py`
+    - 资源分配温度从硬编码 `*3.0` 改为配置项 `cfg.RESOURCE_SOFTMAX_TEMPERATURE`；
+    - 当温度 `<=0` 时，带宽/CPU 分配退化为均匀分配（避免数值异常并支持可控实验）；
+    - UAV reward 自身能耗项改为 `cfg.UAV_REWARD_SELF_ENERGY_COEFF` 控制，默认 `0.0`，避免 MU/UAV 分支对 UAV 能耗双重计入。
+  - `mappo.py`
+    - 新增 `_critic_value_loss(values, returns, old_values)`，支持可选 value clipping（`cfg.USE_VALUE_CLIP` / `cfg.VALUE_CLIP_EPS`）；
+    - attention critic 与 MLP critic 更新路径统一接入 value clipping 损失；
+    - `collect_episode()` 返回 `collected_steps`，供训练主循环按真实采样步数推进。
+  - `train.py`
+    - 训练主循环由“按 episode 固定步长推进”改为“按 `collected_steps` 累积到 `total_steps` 结束”；
+    - 兼容未返回 `collected_steps` 的 agent（回退 `episode_length`）；
+    - 日志 step 输出改为 `current/target` 格式。
+  - `maddpg.py`
+    - `collect_episode()` 返回 `collected_steps`（与新训练主循环语义对齐）。
+
+- 第二十五轮测试补充（TDD：先红后绿）：
+  - `tests/test_environment_metrics.py`
+    - 新增 `test_uav_reward_excludes_self_energy_when_coeff_is_zero`。
+  - `tests/test_mappo_fused_actions_values.py`
+    - 新增 `test_critic_value_loss_uses_clipped_objective`。
+
+- 第二十五轮验收（`.venv`）：
+  - 定向：
+    - `./.venv/bin/python -m pytest -q tests/test_environment_metrics.py tests/test_mappo_fused_actions_values.py tests/test_stage2_alignment_features.py tests/test_train_cli_paper_flags.py`：26/26 通过。
+  - 全量：
+    - `./.venv/bin/python -m unittest discover -s tests -p "test_*.py" -v`：94/94 通过。
+    - `./.venv/bin/python -m pytest -q`：94 passed。

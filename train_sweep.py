@@ -63,6 +63,7 @@ class RunOptions:
     skip_existing: bool
     disable_tensorboard: bool
     smoke: bool
+    paper_mode: bool = False
 
 
 def _build_run_specs_for_setting(fig, algorithm, setting_name, base_kwargs, options: RunOptions):
@@ -73,6 +74,9 @@ def _build_run_specs_for_setting(fig, algorithm, setting_name, base_kwargs, opti
     for seed in options.seeds:
         run_dir = os.path.join(cfg.EXPERIMENT_ROOT, fig_dir, algorithm, setting_name, f"seed_{seed}")
         summary_path = os.path.join(run_dir, "summary.json")
+        cli_overrides = dict(base_kwargs)
+        if bool(options.paper_mode):
+            cli_overrides["paper_mode"] = "on"
         specs.append(
             {
                 "fig": fig,
@@ -82,7 +86,7 @@ def _build_run_specs_for_setting(fig, algorithm, setting_name, base_kwargs, opti
                 "seed": int(seed),
                 "run_dir": run_dir,
                 "summary_path": summary_path,
-                "cli_overrides": dict(base_kwargs),
+                "cli_overrides": cli_overrides,
                 "num_mus": num_mus,
                 "num_uavs": num_uavs,
             }
@@ -558,6 +562,11 @@ def parse_args():
     parser.add_argument("--skip_existing", action="store_true")
     parser.add_argument("--disable_tensorboard", action="store_true")
     parser.add_argument("--smoke", action="store_true", help="small subset for fast pipeline validation")
+    parser.add_argument(
+        "--paper_mode",
+        action="store_true",
+        help="Enable paper-aligned train preset (normalize_reward=off, reward_scale=1.0, prev_assoc, env_episode, best_snr).",
+    )
     return parser.parse_args()
 
 
@@ -576,6 +585,7 @@ def main():
         skip_existing=args.skip_existing,
         disable_tensorboard=args.disable_tensorboard,
         smoke=args.smoke,
+        paper_mode=bool(args.paper_mode),
     )
 
     runners = {

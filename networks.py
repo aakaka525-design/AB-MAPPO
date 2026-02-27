@@ -218,27 +218,48 @@ class AttentionCritic(nn.Module):
     注意力机制Critic (论文 "A" 部分, 公式49-50)
 
     结构:
-      1. 每个智能体的观测 → Encoder MLP → 特征向量 e_i
+      1. MU/UAV 观测分别通过独立Encoder得到特征 e_i
       2. 多头注意力: Q=W_q*e_i, K=W_key*e_j, V=W_v*e_j
-         α_{i,j} = softmax(K^T * Q / √d_key)
+         α_{i,j} = softmax(K^T * Q / √d_key), 且 j != i（屏蔽对角）
          x_i = Σ α_{i,j} * V_j
-      3. [x_i, o_i] → MLP → V(s)
+      3. [x_i, e_i] → MLP → V_i
     """
 
-    def __init__(self, obs_dim, num_agents, num_heads=None):
+    def __init__(
+        self,
+        obs_dim,
+        num_agents,
+        num_mus,
+        num_uavs,
+        mu_obs_dim,
+        uav_obs_dim,
+        num_heads=None,
+    ):
         super().__init__()
         hidden = cfg.HIDDEN_SIZE
         self.num_agents = num_agents
+        self.num_mus = num_mus
+        self.num_uavs = num_uavs
+        self.mu_obs_dim = mu_obs_dim
+        self.uav_obs_dim = uav_obs_dim
         self.num_heads = num_heads or cfg.NUM_ATTENTION_HEADS
         self.head_dim = hidden // self.num_heads
+        if self.num_mus + self.num_uavs != self.num_agents:
+            raise ValueError("num_agents must equal num_mus + num_uavs")
+        if self.head_dim * self.num_heads != hidden:
+            raise ValueError("HIDDEN_SIZE must be divisible by num_heads")
 
-        # 观测编码器
-        self.encoder = nn.Sequential(
-            nn.Linear(obs_dim, hidden),
-            nn.ReLU(),
-            nn.Linear(hidden, hidden),
-            nn.ReLU(),
-        )
+        def _build_encoder(in_dim):
+            return nn.Sequential(
+                nn.Linear(in_dim, hidden),
+                nn.ReLU(),
+                nn.Linear(hidden, hidden),
+                nn.ReLU(),
+            )
+
+        # Distinct encoders for heterogeneous agent observation spaces.
+        self.mu_encoder = _build_encoder(self.mu_obs_dim)
+        self.uav_encoder = _build_encoder(self.uav_obs_dim)
 
         # 注意力 Q, K, V 变换 (公式49-50)
         self.W_query = nn.Linear(hidden, hidden, bias=False)
@@ -252,6 +273,12 @@ class AttentionCritic(nn.Module):
             nn.Linear(hidden, 1),
         )
 
+        # Mask diagonal attention so each agent only attends to others (j != i).
+        attn_bias = torch.zeros((1, 1, self.num_agents, self.num_agents), dtype=torch.float32)
+        diag_idx = torch.arange(self.num_agents)
+        attn_bias[:, :, diag_idx, diag_idx] = float("-inf")
+        self.register_buffer("attn_bias", attn_bias, persistent=False)
+
     def forward(self, all_obs, agent_idx=None):
         """
         Args:
@@ -264,10 +291,20 @@ class AttentionCritic(nn.Module):
         batch_size = all_obs.shape[0]
         N = self.num_agents
 
-        # 编码所有观测
-        obs_flat = all_obs.reshape(batch_size * N, -1)
-        features = self.encoder(obs_flat)  # (B*N, hidden)
-        features = features.reshape(batch_size, N, -1)  # (B, N, hidden)
+        # Encode MU/UAV observations with dedicated encoders.
+        if self.num_mus > 0:
+            mu_obs = all_obs[:, : self.num_mus, : self.mu_obs_dim].reshape(batch_size * self.num_mus, self.mu_obs_dim)
+            mu_features = self.mu_encoder(mu_obs).reshape(batch_size, self.num_mus, -1)
+        else:
+            mu_features = all_obs.new_zeros((batch_size, 0, cfg.HIDDEN_SIZE))
+        if self.num_uavs > 0:
+            uav_obs = all_obs[:, self.num_mus :, : self.uav_obs_dim].reshape(
+                batch_size * self.num_uavs, self.uav_obs_dim
+            )
+            uav_features = self.uav_encoder(uav_obs).reshape(batch_size, self.num_uavs, -1)
+        else:
+            uav_features = all_obs.new_zeros((batch_size, 0, cfg.HIDDEN_SIZE))
+        features = torch.cat([mu_features, uav_features], dim=1)
 
         # 多头注意力
         Q = self.W_query(features)  # (B, N, hidden)
@@ -279,17 +316,20 @@ class AttentionCritic(nn.Module):
         K = K.reshape(batch_size, N, self.num_heads, self.head_dim).transpose(1, 2)
         V = V.reshape(batch_size, N, self.num_heads, self.head_dim).transpose(1, 2)
 
+        attn_bias = self.attn_bias.to(device=Q.device, dtype=Q.dtype)
         # 优先使用 PyTorch 融合注意力算子；旧版本回退到手写实现。
         if hasattr(F, "scaled_dot_product_attention"):
             attn_output = F.scaled_dot_product_attention(
                 Q.contiguous(),
                 K.contiguous(),
                 V.contiguous(),
+                attn_mask=attn_bias,
                 dropout_p=0.0,
             )
         else:
             scale = float(self.head_dim) ** 0.5
             attn_scores = torch.matmul(Q, K.transpose(-2, -1)) / scale  # (B, heads, N, N)
+            attn_scores = attn_scores + attn_bias
             attn_weights = F.softmax(attn_scores, dim=-1)
             attn_output = torch.matmul(attn_weights, V)  # (B, heads, N, head_dim)
         attn_output = attn_output.transpose(1, 2).reshape(batch_size, N, -1)  # (B, N, hidden)
@@ -312,13 +352,14 @@ class MLPCritic(nn.Module):
     def __init__(self, obs_dim, num_agents=None):
         super().__init__()
         hidden = cfg.HIDDEN_SIZE
+        out_dim = int(num_agents) if num_agents is not None else 1
         # 输入: 全局状态或拼接观测
         self.net = nn.Sequential(
             nn.Linear(obs_dim, hidden),
             nn.ReLU(),
             nn.Linear(hidden, hidden),
             nn.ReLU(),
-            nn.Linear(hidden, 1),
+            nn.Linear(hidden, out_dim),
         )
 
     def forward(self, state, agent_idx=None):

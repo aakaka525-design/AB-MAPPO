@@ -897,6 +897,8 @@ NUM_ATTENTION_HEADS = 4
 ENTROPY_COEFF = 0.01
 VALUE_LOSS_COEFF = 0.5
 MAX_GRAD_NORM = 10.0
+USE_VALUE_CLIP = True
+VALUE_CLIP_EPS = PPO_CLIP_EPSILON
 
 
 # ============================================================
@@ -907,9 +909,26 @@ PENALTY_DELAY = 0.1
 PENALTY_BOUNDARY = 0.1
 PENALTY_COLLISION = 0.1
 REWARD_SCALE = 10.0
+RESOURCE_SOFTMAX_TEMPERATURE = 1.0
+# To avoid double-counting UAV energy across MU/UAV rewards, default UAV self-energy term is disabled.
+UAV_REWARD_SELF_ENERGY_COEFF = 0.0
 
 D_MIN = 50.0
 D_TH = 300.0
+
+# Observation / training compatibility switches
+UAV_OBS_MASK_MODE = "none"
+NORMALIZE_REWARD = True
+ROLLOUT_MODE = "fixed"
+BS_RELAY_POLICY = "nearest"
+PAPER_MODE = "off"
+PAPER_PROFILE_NORMALIZE_REWARD = False
+PAPER_PROFILE_REWARD_SCALE = 1.0
+PAPER_PROFILE_UAV_OBS_MASK_MODE = "prev_assoc"
+PAPER_PROFILE_ROLLOUT_MODE = "env_episode"
+PAPER_PROFILE_BS_RELAY_POLICY = "best_snr"
+PAPER_PROFILE_RESOURCE_SOFTMAX_TEMPERATURE = 1.0
+PAPER_PROFILE_UAV_REWARD_SELF_ENERGY_COEFF = 0.0
 
 
 # ============================================================
@@ -1032,7 +1051,7 @@ from typing import Dict, Tuple
 import numpy as np
 
 import config as cfg
-from channel_model import compute_mu_uav_rate, compute_mu_uav_rate_batch
+from channel_model import compute_mu_uav_rate, compute_mu_uav_rate_batch, compute_uav_bs_rate
 
 
 class UAVMECEnv:
@@ -1044,6 +1063,8 @@ class UAVMECEnv:
         num_uavs: int | None = None,
         dt_deviation_rate: float | None = None,
         wo_dt_noise_mode: bool = False,
+        uav_obs_mask_mode: str = cfg.UAV_OBS_MASK_MODE,
+        bs_relay_policy: str = cfg.BS_RELAY_POLICY,
         area_width: float | None = None,
         area_height: float | None = None,
         seed: int | None = None,
@@ -1055,6 +1076,12 @@ class UAVMECEnv:
             float(dt_deviation_rate) if dt_deviation_rate is not None else cfg.DT_DEVIATION_RATE
         )
         self.wo_dt_noise_mode = bool(wo_dt_noise_mode)
+        if uav_obs_mask_mode not in {"none", "prev_assoc"}:
+            raise ValueError("uav_obs_mask_mode must be one of {'none', 'prev_assoc'}")
+        self.uav_obs_mask_mode = str(uav_obs_mask_mode)
+        if bs_relay_policy not in {"nearest", "best_snr", "min_load"}:
+            raise ValueError("bs_relay_policy must be one of {'nearest', 'best_snr', 'min_load'}")
+        self.bs_relay_policy = str(bs_relay_policy)
 
         self.area_width = float(area_width if area_width is not None else cfg.AREA_WIDTH)
         self.area_height = float(area_height if area_height is not None else cfg.AREA_HEIGHT)
@@ -1079,7 +1106,8 @@ class UAVMECEnv:
 
         # MU observation/action dimensions
         self.mu_obs_dim = 2 + self.M * 2 + 2 + self.M
-        self.mu_discrete_dim = self.M + 1
+        # association: 0=local, 1..M=direct UAV offload, M+1=UAV-relayed BS offload
+        self.mu_discrete_dim = self.M + 2
         self.mu_continuous_dim = 1
         self.mu_action_dim = 2
 
@@ -1102,6 +1130,7 @@ class UAVMECEnv:
         self.task_cpu = np.zeros((self.K,), dtype=np.float32)
         self.prev_edge_load = np.zeros((self.M, self.K), dtype=np.float32)
         self.prev_offload_ratio = np.zeros((self.K,), dtype=np.float32)
+        self.prev_association = np.zeros((self.K,), dtype=np.int64)
         self._boundary_violation = np.zeros((self.M,), dtype=np.float32)
         # Pre-allocated work buffers for step() hot path.
         self._bw_alloc_cache = np.zeros((self.K,), dtype=np.float32)
@@ -1140,6 +1169,7 @@ class UAVMECEnv:
         self.uav_velocities = np.zeros((self.M, 2), dtype=np.float32)
         self.prev_edge_load = np.zeros((self.M, self.K), dtype=np.float32)
         self.prev_offload_ratio = np.zeros((self.K,), dtype=np.float32)
+        self.prev_association = np.zeros((self.K,), dtype=np.int64)
         self._boundary_violation = np.zeros((self.M,), dtype=np.float32)
         self._generate_tasks()
         return self._get_observations()
@@ -1191,17 +1221,21 @@ class UAVMECEnv:
 
     def _update_uav_positions(self, uav_velocity_actions: np.ndarray) -> None:
         target_v = (uav_velocity_actions * 2.0 - 1.0) * cfg.UAV_MAX_VELOCITY
-        dv = target_v - self.uav_velocities
+        v_prev = self.uav_velocities.copy()
+        dv = target_v - v_prev
         dv_norm = np.linalg.norm(dv, axis=1, keepdims=True)
         max_dv = cfg.UAV_MAX_ACCELERATION * cfg.TIME_SLOT
         scale = np.where(dv_norm > max_dv, max_dv / (dv_norm + 1e-8), 1.0)
-        self.uav_velocities += dv * scale
+        applied_dv = dv * scale
+        applied_acc = applied_dv / max(cfg.TIME_SLOT, 1e-8)
+        v_next = v_prev + applied_dv
 
-        v_norm = np.linalg.norm(self.uav_velocities, axis=1, keepdims=True)
+        v_norm = np.linalg.norm(v_next, axis=1, keepdims=True)
         scale_v = np.where(v_norm > cfg.UAV_MAX_VELOCITY, cfg.UAV_MAX_VELOCITY / (v_norm + 1e-8), 1.0)
-        self.uav_velocities *= scale_v
+        self.uav_velocities = v_next * scale_v
 
-        raw_pos = self.uav_positions + self.uav_velocities * cfg.TIME_SLOT
+        dt = cfg.TIME_SLOT
+        raw_pos = self.uav_positions + v_prev * dt + 0.5 * applied_acc * (dt**2)
         clipped = raw_pos.copy()
         clipped[:, 0] = np.clip(clipped[:, 0], 0.0, self.area_width)
         clipped[:, 1] = np.clip(clipped[:, 1], 0.0, self.area_height)
@@ -1362,6 +1396,9 @@ class UAVMECEnv:
         per_mu_view[:, :, 2] = self.prev_offload_ratio[None, :]
         per_mu_view[:, :, 3] = task_data_norm[None, :]
         per_mu_view[:, :, 4] = task_cpu_norm[None, :]
+        if self.uav_obs_mask_mode == "prev_assoc":
+            assoc_mask = self.prev_association[None, :] == (np.arange(self.M, dtype=np.int64)[:, None] + 1)
+            per_mu_view *= assoc_mask[:, :, None].astype(np.float32)
 
         if self.M > 1:
             other_uav = uav_pos_norm[self._other_uav_col_idx].reshape(self.M, self.M - 1, 2).reshape(self.M, -1)
@@ -1369,15 +1406,58 @@ class UAVMECEnv:
 
         return self._apply_wo_dt_noise({"mu_obs": mu_obs, "uav_obs": uav_obs})
 
+    def _select_bs_relay_uav(self, bs_indices: np.ndarray, effective_uav_idx: np.ndarray) -> np.ndarray:
+        """Select relay UAV index for BS-offloaded MUs according to configured policy."""
+        if bs_indices.size == 0:
+            return np.empty((0,), dtype=np.int64)
+
+        bs_mu_pos = self.mu_positions[bs_indices]
+        deltas = bs_mu_pos[:, None, :] - self.uav_positions[None, :, :]
+        dists = np.sqrt(np.sum(deltas**2, axis=2)).astype(np.float32)
+        if self.bs_relay_policy == "nearest":
+            return np.argmin(dists, axis=1).astype(np.int64)
+        if self.bs_relay_policy == "best_snr":
+            # Use equal per-link bandwidth to score first-hop MU->UAV quality.
+            bw = np.full((bs_indices.size,), cfg.BANDWIDTH, dtype=np.float32)
+            score = compute_mu_uav_rate_batch(
+                np.repeat(bs_mu_pos[:, None, :], self.M, axis=1).reshape(-1, 2),
+                np.repeat(self.uav_positions[None, :, :], bs_indices.size, axis=0).reshape(-1, 2),
+                np.repeat(bw[:, None], self.M, axis=1).reshape(-1),
+            ).reshape(bs_indices.size, self.M)
+            return np.argmax(score, axis=1).astype(np.int64)
+
+        # min_load: greedily assign each BS relay MU to the currently least-loaded UAV.
+        load = np.bincount(np.maximum(effective_uav_idx, -1) + 1, minlength=self.M + 1)[1:].astype(np.int64)
+        chosen = np.empty((bs_indices.size,), dtype=np.int64)
+        for i in range(bs_indices.size):
+            min_load = np.min(load)
+            candidates = np.where(load == min_load)[0]
+            if candidates.size == 1:
+                picked = int(candidates[0])
+            else:
+                picked = int(candidates[np.argmin(dists[i, candidates])])
+            chosen[i] = picked
+            load[picked] += 1
+        return chosen
+
     def step(self, mu_actions: Dict, uav_actions: np.ndarray) -> Tuple[Dict, Dict, bool, Dict]:
         association = np.asarray(mu_actions["association"], dtype=np.int64).copy()
         offload_ratio = np.asarray(mu_actions["offload_ratio"], dtype=np.float32).copy()
 
-        association = np.clip(association, 0, self.M)
+        bs_label = self.M + 1
+        association = np.clip(association, 0, bs_label)
         offload_ratio = np.clip(offload_ratio, 0.0, 1.0)
 
         local_mask = association == 0
         offload_ratio[local_mask] = 0.0
+        bs_mask = association == bs_label
+
+        effective_uav_idx = np.full((self.K,), -1, dtype=np.int64)
+        direct_assoc = (association > 0) & (association <= self.M)
+        effective_uav_idx[direct_assoc] = association[direct_assoc] - 1
+        if np.any(bs_mask):
+            bs_indices = np.where(bs_mask)[0]
+            effective_uav_idx[bs_indices] = self._select_bs_relay_uav(bs_indices, effective_uav_idx)
 
         uav_actions = np.asarray(uav_actions, dtype=np.float32)
         if uav_actions.shape != (self.M, self.uav_continuous_dim):
@@ -1392,7 +1472,8 @@ class UAVMECEnv:
         # 2) Resource allocation
         raw_bw = uav_actions[:, 2 : 2 + self.K]
         raw_cpu = uav_actions[:, 2 + self.K : 2 + 2 * self.K]
-        assoc_mus_list = [np.where(association == (m + 1))[0] for m in range(self.M)]
+        direct_assoc_mus_list = [np.where(association == (m + 1))[0] for m in range(self.M)]
+        assoc_mus_list = [np.where(effective_uav_idx == m)[0] for m in range(self.M)]
 
         bandwidth_alloc = self._bw_alloc_cache
         bandwidth_alloc.fill(0.0)
@@ -1402,15 +1483,26 @@ class UAVMECEnv:
         edge_load.fill(0.0)
 
         for m in range(self.M):
+            # OFDMA bandwidth is shared by all MU links associated with UAV m,
+            # including BS-relay first-hop links.
             assoc_mus = assoc_mus_list[m]
-            if len(assoc_mus) == 0:
-                continue
+            if len(assoc_mus) > 0:
+                temp = float(cfg.RESOURCE_SOFTMAX_TEMPERATURE)
+                if temp <= 0.0:
+                    bw_weights = np.full((len(assoc_mus),), 1.0 / float(len(assoc_mus)), dtype=np.float32)
+                else:
+                    bw_weights = self._softmax(raw_bw[m, assoc_mus] * temp)
+                bandwidth_alloc[assoc_mus] = bw_weights * cfg.BANDWIDTH
 
-            bw_weights = self._softmax(raw_bw[m, assoc_mus] * 3.0)
-            cpu_weights = self._softmax(raw_cpu[m, assoc_mus] * 3.0)
-
-            bandwidth_alloc[assoc_mus] = bw_weights * cfg.BANDWIDTH
-            cpu_alloc[assoc_mus] = cpu_weights * cfg.UAV_MAX_CPU_FREQ
+            # UAV CPU is only used by direct edge-compute tasks.
+            direct_assoc_mus = direct_assoc_mus_list[m]
+            if len(direct_assoc_mus) > 0:
+                temp = float(cfg.RESOURCE_SOFTMAX_TEMPERATURE)
+                if temp <= 0.0:
+                    cpu_weights = np.full((len(direct_assoc_mus),), 1.0 / float(len(direct_assoc_mus)), dtype=np.float32)
+                else:
+                    cpu_weights = self._softmax(raw_cpu[m, direct_assoc_mus] * temp)
+                cpu_alloc[direct_assoc_mus] = cpu_weights * cfg.UAV_MAX_CPU_FREQ
 
         # 3) Energy and latency
         l_all = self.task_data
@@ -1436,36 +1528,70 @@ class UAVMECEnv:
         np.copyto(mu_energy, e_loc_all)
         t_edge_all = self._t_edge_cache
         t_edge_all.fill(0.0)
+        # Non-flight UAV energy accumulator:
+        # - direct branch: UAV computing energy
+        # - relay branch: UAV forwarding transmission energy
         uav_comp_energy = self._uav_comp_cache
         uav_comp_energy.fill(0.0)
-        offload_mask = (association > 0) & (offload_ratio > 1e-8)
+        offload_mask = (effective_uav_idx >= 0) & (offload_ratio > 1e-8)
         offload_indices = np.where(offload_mask)[0]
         if offload_indices.size > 0:
-            uav_idx = association[offload_indices] - 1
-            bw = np.maximum(bandwidth_alloc[offload_indices], 1e3)
-            cpu = np.maximum(cpu_alloc[offload_indices], 1e3)
+            offload_assoc = association[offload_indices]
+            direct_mask = offload_assoc <= self.M
+            if np.any(direct_mask):
+                direct_indices = offload_indices[direct_mask]
+                uav_idx = effective_uav_idx[direct_indices]
+                bw = np.maximum(bandwidth_alloc[direct_indices], 1e3)
+                cpu = np.maximum(cpu_alloc[direct_indices], 1e3)
 
-            offload_data = offload_ratio[offload_indices] * l_all[offload_indices]
-            rates = compute_mu_uav_rate_batch(
-                self.mu_positions[offload_indices],
-                self.uav_positions[uav_idx],
-                bw,
-            ).astype(np.float32)
-            rates = np.maximum(rates, 1e3)
+                offload_data = offload_ratio[direct_indices] * l_all[direct_indices]
+                rates = compute_mu_uav_rate_batch(
+                    self.mu_positions[direct_indices],
+                    self.uav_positions[uav_idx],
+                    bw,
+                ).astype(np.float32)
+                rates = np.maximum(rates, 1e3)
 
-            t_off = offload_data / rates
-            e_off = cfg.MU_TRANSMIT_POWER * t_off
+                t_off = offload_data / rates
+                e_off = cfg.MU_TRANSMIT_POWER * t_off
 
-            y_edge = offload_ratio[offload_indices] * l_all[offload_indices] * c_all[offload_indices]
-            f_dev_edge = cpu * self.dt_deviation_rate * self.rng.uniform(-1.0, 1.0, size=offload_indices.size)
-            f_actual_edge = np.maximum(cpu + f_dev_edge, cpu * 0.1)
-            t_ecmp = y_edge / np.maximum(f_actual_edge, 1e3)
-            e_edge = cfg.EFFECTIVE_CAPACITANCE * (f_actual_edge**2) * y_edge
+                y_edge = offload_ratio[direct_indices] * l_all[direct_indices] * c_all[direct_indices]
+                f_dev_edge = cpu * self.dt_deviation_rate * self.rng.uniform(-1.0, 1.0, size=direct_indices.size)
+                f_actual_edge = np.maximum(cpu + f_dev_edge, cpu * 0.1)
+                t_ecmp = y_edge / np.maximum(f_actual_edge, 1e3)
+                e_edge = cfg.EFFECTIVE_CAPACITANCE * (f_actual_edge**2) * y_edge
 
-            mu_energy[offload_indices] += e_off.astype(np.float32)
-            t_edge_all[offload_indices] = (t_off + t_ecmp).astype(np.float32)
-            uav_comp_energy += np.bincount(uav_idx, weights=e_edge, minlength=self.M).astype(np.float32)
-            edge_load[uav_idx, offload_indices] = y_edge.astype(np.float32)
+                mu_energy[direct_indices] += e_off.astype(np.float32)
+                t_edge_all[direct_indices] = (t_off + t_ecmp).astype(np.float32)
+                uav_comp_energy += np.bincount(uav_idx, weights=e_edge, minlength=self.M).astype(np.float32)
+                edge_load[uav_idx, direct_indices] = y_edge.astype(np.float32)
+
+            relay_mask = offload_assoc == bs_label
+            if np.any(relay_mask):
+                relay_indices = offload_indices[relay_mask]
+                relay_uav = effective_uav_idx[relay_indices]
+                bw_first_hop = np.maximum(bandwidth_alloc[relay_indices], 1e3)
+                offload_data = offload_ratio[relay_indices] * l_all[relay_indices]
+
+                rates_mu_uav = compute_mu_uav_rate_batch(
+                    self.mu_positions[relay_indices],
+                    self.uav_positions[relay_uav],
+                    bw_first_hop,
+                ).astype(np.float32)
+                rates_mu_uav = np.maximum(rates_mu_uav, 1e3)
+                t_mu_uav = offload_data / rates_mu_uav
+                e_mu_uav = cfg.MU_TRANSMIT_POWER * t_mu_uav
+
+                rates_uav_bs = np.maximum(compute_uav_bs_rate(self.uav_positions[relay_uav]).astype(np.float32), 1e3)
+                t_uav_bs = offload_data / rates_uav_bs
+                e_uav_relay_tx = cfg.UAV_TRANSMIT_POWER * t_uav_bs
+
+                mu_energy[relay_indices] += e_mu_uav.astype(np.float32)
+                # BS-side compute delay is assumed negligible in the paper setting.
+                t_edge_all[relay_indices] = (t_mu_uav + t_uav_bs).astype(np.float32)
+                uav_comp_energy += np.bincount(relay_uav, weights=e_uav_relay_tx, minlength=self.M).astype(np.float32)
+                y_relay = offload_ratio[relay_indices] * l_all[relay_indices] * c_all[relay_indices]
+                edge_load[relay_uav, relay_indices] = y_relay.astype(np.float32)
 
         v = np.linalg.norm(self.uav_velocities, axis=1)
         term1 = 0.5 * cfg.FUSELAGE_DRAG_RATIO * cfg.AIR_DENSITY * cfg.ROTOR_SOLIDITY * cfg.ROTOR_DISC_AREA * (v**3)
@@ -1478,7 +1604,11 @@ class UAVMECEnv:
         np.add(uav_fly_energy, uav_comp_energy, out=uav_total_energy)
 
         # 4) Rewards
-        assoc_counts = np.bincount(association, minlength=self.M + 1)[1:]
+        valid_assoc = effective_uav_idx >= 0
+        if np.any(valid_assoc):
+            assoc_counts = np.bincount(effective_uav_idx[valid_assoc], minlength=self.M)
+        else:
+            assoc_counts = np.zeros((self.M,), dtype=np.int64)
         n_assoc_per_uav = np.maximum(assoc_counts, 1.0).astype(np.float32)
 
         latency_penalty_all = self._latency_penalty_cache
@@ -1490,20 +1620,19 @@ class UAVMECEnv:
 
         mu_rewards = self._mu_rewards_cache
         mu_rewards[:] = -mu_energy - latency_penalty_all
-        valid_assoc = association > 0
         if np.any(valid_assoc):
-            uav_indices = association[valid_assoc] - 1
+            uav_indices = effective_uav_idx[valid_assoc]
             mu_rewards[valid_assoc] -= (
                 cfg.WEIGHT_FACTOR * uav_total_energy[uav_indices] / n_assoc_per_uav[uav_indices]
             ).astype(np.float32)
         mu_rewards *= cfg.REWARD_SCALE
 
         uav_rewards = self._uav_rewards_cache
-        uav_rewards[:] = -cfg.WEIGHT_FACTOR * uav_total_energy
+        uav_rewards[:] = -np.float32(cfg.UAV_REWARD_SELF_ENERGY_COEFF) * uav_total_energy
         collision_penalties = self._collision_penalties()
         boundary_penalties = (cfg.PENALTY_BOUNDARY * self._boundary_violation).astype(np.float32)
         if np.any(valid_assoc):
-            assoc_uav = association[valid_assoc] - 1
+            assoc_uav = effective_uav_idx[valid_assoc]
             mu_energy_sum_per_uav = np.bincount(assoc_uav, weights=mu_energy[valid_assoc], minlength=self.M)
             latency_sum_per_uav = np.bincount(assoc_uav, weights=latency_penalty_all[valid_assoc], minlength=self.M)
             cooperative_penalty = (mu_energy_sum_per_uav + latency_sum_per_uav) / n_assoc_per_uav
@@ -1517,6 +1646,7 @@ class UAVMECEnv:
         # 5) State update
         self.prev_edge_load[:] = edge_load
         self.prev_offload_ratio[:] = offload_ratio
+        self.prev_association[:] = np.where(effective_uav_idx >= 0, effective_uav_idx + 1, 0).astype(np.int64)
         self._update_mu_mobility()
         self._generate_tasks()
         self.time_step += 1
@@ -1530,11 +1660,15 @@ class UAVMECEnv:
         weighted_energy_mu_avg = mu_energy_avg + cfg.WEIGHT_FACTOR * uav_energy_avg
         weighted_energy_mu_total = float(np.sum(mu_energy) + cfg.WEIGHT_FACTOR * np.sum(uav_total_energy))
 
-        # Fairness is computed over MU utility (inverse energy cost), not raw cost.
-        # This better reflects "service fairness" in paper-style comparisons.
+        # Paper-aligned fairness on MU energy costs.
+        fairness_denom = float(self.K * np.sum(mu_energy**2) + 1e-8)
+        jain_fairness = float((np.sum(mu_energy) ** 2) / fairness_denom) if fairness_denom > 0 else 1.0
+        # Legacy utility-based fairness retained for backward-compatible analysis scripts.
         mu_utility = 1.0 / (mu_energy + 1e-8)
-        fairness_denom = float(self.K * np.sum(mu_utility**2) + 1e-8)
-        jain_fairness = float((np.sum(mu_utility) ** 2) / fairness_denom) if fairness_denom > 0 else 1.0
+        utility_fairness_denom = float(self.K * np.sum(mu_utility**2) + 1e-8)
+        jain_fairness_utility = (
+            float((np.sum(mu_utility) ** 2) / utility_fairness_denom) if utility_fairness_denom > 0 else 1.0
+        )
 
         max_delay = np.maximum(t_loc_all, t_edge_all)
         info = {
@@ -1548,6 +1682,7 @@ class UAVMECEnv:
             "mu_energy_avg": mu_energy_avg,
             "uav_energy_avg": uav_energy_avg,
             "jain_fairness": jain_fairness,
+            "jain_fairness_utility": jain_fairness_utility,
             "avg_delay": float(np.mean(max_delay)),
             "delay_violation_rate": float(np.mean(max_delay > cfg.TIME_SLOT)),
         }
@@ -1604,6 +1739,185 @@ if __name__ == "__main__":
         idx = sys.argv.index("--fig")
         sys.argv[idx] = "--figs"
     main()
+```
+
+## experiment_validator.py
+
+```python
+"""
+Experiment output consistency checks for full sweep pipelines.
+
+This module verifies:
+1) expected run summaries exist and match requested params
+2) aggregate JSON files are present and newer than source summaries
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from typing import Dict, Iterable, List
+
+import config as cfg
+from train_sweep import RunOptions, build_run_specs
+
+
+def _canonical_algo_name(name: str) -> str:
+    return "Randomized" if str(name) == "Random" else str(name)
+
+
+def _spec_id(spec: dict) -> str:
+    return (
+        f"fig={spec.get('fig')} algo={spec.get('algorithm')} "
+        f"setting={spec.get('setting_name')} seed={spec.get('seed')}"
+    )
+
+
+def _load_json(path: str):
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def validate_run_summaries(specs: Iterable[dict], total_steps: int, episode_length: int) -> List[str]:
+    errors: List[str] = []
+    for spec in specs:
+        summary_path = str(spec["summary_path"])
+        sid = _spec_id(spec)
+        if not os.path.exists(summary_path):
+            errors.append(f"{sid}: missing summary: {summary_path}")
+            continue
+
+        try:
+            summary = _load_json(summary_path)
+        except Exception as exc:
+            errors.append(f"{sid}: failed to load summary ({summary_path}): {exc}")
+            continue
+
+        checks = [
+            ("algorithm", _canonical_algo_name(spec.get("algorithm")), _canonical_algo_name(summary.get("algorithm"))),
+            ("seed", int(spec.get("seed")), int(summary.get("seed", -1))),
+            ("num_mus", int(spec.get("num_mus", -1)), int(summary.get("num_mus", -1))),
+            ("num_uavs", int(spec.get("num_uavs", -1)), int(summary.get("num_uavs", -1))),
+            ("total_steps", int(total_steps), int(summary.get("total_steps", -1))),
+            ("episode_length", int(episode_length), int(summary.get("episode_length", -1))),
+        ]
+        for key, expected, actual in checks:
+            if expected != actual:
+                errors.append(f"{sid}: {key} mismatch (expected={expected}, actual={actual})")
+    return errors
+
+
+def default_aggregate_paths(experiment_root: str | None = None) -> Dict[str, str]:
+    root = experiment_root or cfg.EXPERIMENT_ROOT
+    paths = {"base": os.path.join(root, "base", "aggregate", "convergence.json")}
+    for fig in ("6", "7", "8", "9", "10", "11", "12"):
+        paths[fig] = os.path.join(root, f"fig{fig}", "aggregate", "results.json")
+    return paths
+
+
+def validate_aggregate_freshness(specs: Iterable[dict], aggregate_paths: Dict[str, str]) -> List[str]:
+    errors: List[str] = []
+    latest_summary_mtime: Dict[str, float] = {}
+    for spec in specs:
+        fig = str(spec.get("fig"))
+        summary_path = str(spec.get("summary_path"))
+        if not os.path.exists(summary_path):
+            continue
+        try:
+            mt = os.path.getmtime(summary_path)
+        except OSError:
+            continue
+        latest_summary_mtime[fig] = max(latest_summary_mtime.get(fig, 0.0), mt)
+
+    for fig, latest_mt in latest_summary_mtime.items():
+        aggregate_path = aggregate_paths.get(fig)
+        if not aggregate_path:
+            errors.append(f"fig={fig}: missing aggregate path mapping")
+            continue
+        if not os.path.exists(aggregate_path):
+            errors.append(f"fig={fig}: missing aggregate: {aggregate_path}")
+            continue
+        try:
+            agg_mt = os.path.getmtime(aggregate_path)
+        except OSError as exc:
+            errors.append(f"fig={fig}: aggregate stat failed ({aggregate_path}): {exc}")
+            continue
+        if agg_mt + 1e-6 < latest_mt:
+            errors.append(
+                f"fig={fig}: stale aggregate ({aggregate_path}) older than latest summary mtime "
+                f"(aggregate={agg_mt:.3f}, latest_summary={latest_mt:.3f})"
+            )
+
+        # Ensure aggregate is valid JSON as a final gate.
+        try:
+            _load_json(aggregate_path)
+        except Exception as exc:
+            errors.append(f"fig={fig}: aggregate JSON parse failed ({aggregate_path}): {exc}")
+    return errors
+
+
+def validate_paper_profile(specs: Iterable[dict]) -> List[str]:
+    errors: List[str] = []
+    expected = {
+        "paper_mode": True,
+        "normalize_reward": bool(cfg.PAPER_PROFILE_NORMALIZE_REWARD),
+        "uav_obs_mask_mode": str(cfg.PAPER_PROFILE_UAV_OBS_MASK_MODE),
+        "rollout_mode": str(cfg.PAPER_PROFILE_ROLLOUT_MODE),
+        "bs_relay_policy": str(cfg.PAPER_PROFILE_BS_RELAY_POLICY),
+    }
+    expected_reward_scale = float(cfg.PAPER_PROFILE_REWARD_SCALE)
+
+    for spec in specs:
+        summary_path = str(spec["summary_path"])
+        sid = _spec_id(spec)
+        if not os.path.exists(summary_path):
+            continue
+        try:
+            summary = _load_json(summary_path)
+        except Exception:
+            continue
+
+        for key, expected_value in expected.items():
+            actual = summary.get(key)
+            if actual != expected_value:
+                errors.append(f"{sid}: {key} mismatch (expected={expected_value}, actual={actual})")
+
+        actual_scale = float(summary.get("reward_scale", float("nan")))
+        if abs(actual_scale - expected_reward_scale) > 1e-8:
+            errors.append(
+                f"{sid}: reward_scale mismatch (expected={expected_reward_scale}, actual={actual_scale})"
+            )
+    return errors
+
+
+def validate_experiment_outputs(
+    total_steps: int,
+    episode_length: int,
+    seeds: list[int],
+    fig: str = "all",
+    experiment_root: str | None = None,
+    paper_mode: bool = False,
+) -> None:
+    options = RunOptions(
+        seeds=[int(s) for s in seeds],
+        device="cpu",
+        total_steps=int(total_steps),
+        episode_length=int(episode_length),
+        resume=True,
+        skip_existing=False,
+        disable_tensorboard=True,
+        smoke=False,
+        paper_mode=bool(paper_mode),
+    )
+    specs = build_run_specs(fig, options)
+    errors = validate_run_summaries(specs, total_steps=int(total_steps), episode_length=int(episode_length))
+    if paper_mode:
+        errors.extend(validate_paper_profile(specs))
+    errors.extend(validate_aggregate_freshness(specs, default_aggregate_paths(experiment_root)))
+    if errors:
+        detail = "\n".join(f"- {e}" for e in errors[:100])
+        extra = "" if len(errors) <= 100 else f"\n- ... and {len(errors) - 100} more"
+        raise RuntimeError(f"Experiment validation failed with {len(errors)} issue(s):\n{detail}{extra}")
 ```
 
 ## generate_figures.py
@@ -2223,6 +2537,146 @@ if __name__ == "__main__":
     main()
 ```
 
+## gpu_profile.py
+
+```python
+"""
+GPU vs CPU 对比 profiling — 在服务器上直接运行
+用法: python gpu_profile.py
+"""
+import os, sys, time
+os.environ["OMP_NUM_THREADS"] = "1"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import numpy as np
+import torch
+from environment import UAVMECEnv
+from mappo import ABMAPPO
+import config as cfg
+
+
+def profile_device(device_str, num_episodes=5, k=60, m=10):
+    print(f"\n{'='*60}")
+    print(f"Profiling: device={device_str} K={k} M={m} episodes={num_episodes}")
+    print(f"{'='*60}")
+
+    env = UAVMECEnv(num_mus=k, num_uavs=m, seed=42)
+    agent = ABMAPPO(env, algorithm="AB-MAPPO", device=device_str)
+
+    # Warmup 1 episode (includes torch.compile if CUDA)
+    print("Warmup...")
+    t_warmup = time.perf_counter()
+    agent.collect_episode()
+    agent.update()
+    warmup_time = time.perf_counter() - t_warmup
+    print(f"  Warmup: {warmup_time:.2f}s (includes compilation if any)")
+
+    # 分模块计时
+    t_collect = 0.0
+    t_update = 0.0
+    t_total = time.perf_counter()
+
+    for ep in range(num_episodes):
+        t0 = time.perf_counter()
+        stats = agent.collect_episode()
+        t_collect += time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        agent.update()
+        t_update += time.perf_counter() - t0
+
+    total = time.perf_counter() - t_total
+    eps_s = num_episodes / total
+
+    print(f"\n  结果 ({num_episodes} episodes, 不含 warmup):")
+    print(f"    总耗时:     {total:.2f}s")
+    print(f"    eps/s:      {eps_s:.2f}")
+    print(f"    collect:    {t_collect:.2f}s ({t_collect/total*100:.1f}%)")
+    print(f"    update:     {t_update:.2f}s ({t_update/total*100:.1f}%)")
+    print(f"    每episode:  collect={t_collect/num_episodes:.3f}s + update={t_update/num_episodes:.3f}s")
+
+    if "cuda" in device_str and torch.cuda.is_available():
+        print(f"    GPU 显存峰值: {torch.cuda.max_memory_allocated()/1024/1024:.1f} MB")
+        torch.cuda.reset_peak_memory_stats()
+
+    return eps_s
+
+
+def profile_parallel_gpu(num_jobs, num_episodes=3):
+    """模拟多个 GPU job 并行（用 torch.multiprocessing）"""
+    import subprocess
+    print(f"\n{'='*60}")
+    print(f"模拟 {num_jobs} 个 CUDA job 并行")
+    print(f"{'='*60}")
+
+    script = f'''
+import os, sys, time
+os.environ["OMP_NUM_THREADS"] = "1"
+sys.path.insert(0, ".")
+from environment import UAVMECEnv
+from mappo import ABMAPPO
+env = UAVMECEnv(num_mus=60, num_uavs=10, seed=int(sys.argv[1]))
+agent = ABMAPPO(env, algorithm="AB-MAPPO", device="cuda")
+agent.collect_episode(); agent.update()  # warmup
+t0 = time.time()
+for _ in range({num_episodes}):
+    agent.collect_episode(); agent.update()
+print(f"seed={{sys.argv[1]}} eps/s={{{num_episodes}/(time.time()-t0):.2f}}")
+'''
+
+    procs = []
+    t0 = time.perf_counter()
+    for i in range(num_jobs):
+        p = subprocess.Popen(
+            [sys.executable, "-c", script, str(42 + i)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env={**os.environ, "OMP_NUM_THREADS": "1"}
+        )
+        procs.append(p)
+
+    for p in procs:
+        stdout, stderr = p.communicate()
+        out = stdout.decode().strip()
+        if out:
+            print(f"  {out}")
+        if p.returncode != 0:
+            err = stderr.decode().strip()[-200:]
+            print(f"  ERROR: {err}")
+
+    wall = time.perf_counter() - t0
+    print(f"  {num_jobs} 并行总耗时: {wall:.1f}s | 总吞吐: {num_jobs * num_episodes / wall:.2f} eps/s")
+
+
+if __name__ == "__main__":
+    print(f"PyTorch: {torch.__version__}")
+    print(f"CUDA available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        free, total = torch.cuda.mem_get_info()
+        print(f"VRAM: {free/1024**3:.1f}GB free / {total/1024**3:.1f}GB total")
+
+    # 1. CPU 基准
+    cpu_eps = profile_device("cpu", num_episodes=5, k=60, m=10)
+
+    # 2. GPU 基准
+    if torch.cuda.is_available():
+        gpu_eps = profile_device("cuda", num_episodes=5, k=60, m=10)
+        print(f"\n  GPU/CPU 加速比: {gpu_eps/cpu_eps:.2f}x")
+
+        # 3. GPU 多进程并行
+        for n in [2, 4, 8]:
+            try:
+                profile_parallel_gpu(n, num_episodes=3)
+            except Exception as e:
+                print(f"  {n} 并行失败: {e}")
+
+    # 4. K=100 大配置
+    print("\n\n=== K=100 大配置 ===")
+    profile_device("cpu", num_episodes=3, k=100, m=10)
+    if torch.cuda.is_available():
+        profile_device("cuda", num_episodes=3, k=100, m=10)
+```
+
 ## maddpg.py
 
 ```python
@@ -2334,7 +2788,8 @@ class MADDPG:
         self.M = env.M
 
         # MU actor outputs association probabilities and offload ratio.
-        self.mu_assoc_dim = self.M + 1
+        # Match environment discrete choices: 0=local, 1..M=UAV direct, M+1=BS relay.
+        self.mu_assoc_dim = self.M + 2
         self.mu_cont_dim = 1
         self.mu_repr_dim = self.mu_assoc_dim + self.mu_cont_dim
         self.uav_action_dim = env.uav_continuous_dim
@@ -2464,6 +2919,7 @@ class MADDPG:
             "mu_reward": float(np.mean(mu_rewards_all)),
             "uav_reward": float(np.mean(uav_rewards_all)),
             "total_cost": float(-np.mean(mu_rewards_all)),
+            "collected_steps": int(cfg.EPISODE_LENGTH),
             "weighted_energy": float(np.mean([i["weighted_energy"] for i in ep_info])),
             "weighted_energy_mu_avg": float(np.mean([i["weighted_energy_mu_avg"] for i in ep_info])),
             "weighted_energy_mu_total": float(np.mean([i["weighted_energy_mu_total"] for i in ep_info])),
@@ -2592,6 +3048,7 @@ AB-MAPPO 论文复现 — 核心算法 (精确版)
 
 import os
 from contextlib import nullcontext
+import warnings
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -2631,12 +3088,25 @@ class RunningMeanStd:
         return (x - self.mean) / (np.sqrt(self.var) + 1e-8)
 
 class ABMAPPO:
-    def __init__(self, env: UAVMECEnv, algorithm='AB-MAPPO', device='cpu'):
+    def __init__(
+        self,
+        env: UAVMECEnv,
+        algorithm='AB-MAPPO',
+        device='cpu',
+        normalize_reward: bool = True,
+        rollout_mode: str = cfg.ROLLOUT_MODE,
+    ):
         self.env = env
         self.algorithm = algorithm
         self.device = torch.device(device)
         self.K = env.K
         self.M = env.M
+        self.normalize_reward = bool(normalize_reward)
+        self._warned_scalar_critic_output = False
+        if rollout_mode not in {"fixed", "env_episode"}:
+            raise ValueError("rollout_mode must be one of {'fixed', 'env_episode'}")
+        self.rollout_mode = rollout_mode
+        self.rollout_length = cfg.EPISODE_LENGTH if self.rollout_mode == "fixed" else int(self.env.max_steps)
 
         # 动作维度
         self.mu_action_dim = 2   # [discrete(1), offload_ratio(1)]
@@ -2668,11 +3138,15 @@ class ABMAPPO:
             self.critic = AttentionCritic(
                 obs_dim=self.critic_obs_dim,
                 num_agents=self.K + self.M,
+                num_mus=self.K,
+                num_uavs=self.M,
+                mu_obs_dim=env.mu_obs_dim,
+                uav_obs_dim=env.uav_obs_dim,
                 num_heads=cfg.NUM_ATTENTION_HEADS
             ).to(self.device)
         else:
             self.critic_obs_dim = env.state_dim
-            self.critic = MLPCritic(obs_dim=self.critic_obs_dim).to(self.device)
+            self.critic = MLPCritic(obs_dim=self.critic_obs_dim, num_agents=self.K + self.M).to(self.device)
 
         if hasattr(torch, "compile") and self.device.type == "cuda" and os.name != "nt":
             try:
@@ -2699,7 +3173,7 @@ class ABMAPPO:
             mu_obs_dim=env.mu_obs_dim, uav_obs_dim=env.uav_obs_dim,
             mu_action_dim=self.mu_action_dim,
             uav_action_dim=self.uav_action_dim,
-            buffer_size=cfg.EPISODE_LENGTH,
+            buffer_size=self.rollout_length,
             state_dim=env.state_dim,
         )
 
@@ -2732,7 +3206,7 @@ class ABMAPPO:
         mu_log_probs_np = mu_log_probs.cpu().numpy()
 
         association = mu_actions_np[:, 0].astype(int)
-        association = np.clip(association, 0, self.M)
+        association = np.clip(association, 0, self.M + 1)
         offload_ratio = np.clip(mu_actions_np[:, 1], 0, 1)
 
         # UAV动作 (2 + 2K 维)
@@ -2779,9 +3253,22 @@ class ABMAPPO:
     def _values_from_state(self, state: np.ndarray | None = None) -> Tuple[np.ndarray, np.ndarray]:
         state_np = self.env.get_state() if state is None else state
         state_t = torch.as_tensor(state_np, dtype=torch.float32, device=self.device).unsqueeze(0)
-        v = self.critic(state_t).item()
-        # MLP critic is a centralized scalar-value baseline; broadcast to all agents by design.
-        return np.full(self.K, v), np.full(self.M, v)
+        values = self.critic(state_t).squeeze(0).detach().cpu().numpy().reshape(-1)
+        if values.size == 1:
+            if not self._warned_scalar_critic_output:
+                warnings.warn(
+                    "MLP critic returned scalar value; broadcasting to all agents. "
+                    "Check critic output dimension configuration.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                self._warned_scalar_critic_output = True
+            v = float(values.item())
+            return np.full(self.K, v), np.full(self.M, v)
+        expected = self.K + self.M
+        if values.size != expected:
+            raise ValueError(f"MLP critic output size mismatch: expected {expected}, got {values.size}")
+        return values[: self.K], values[self.K :]
 
     @torch.no_grad()
     def get_actions(self, observations, deterministic=False):
@@ -2792,7 +3279,7 @@ class ABMAPPO:
         return self._actions_from_tensors(mu_obs, uav_obs, deterministic=deterministic)
 
     def _get_random_actions(self):
-        association = np.random.randint(0, self.M + 1, size=self.K)
+        association = np.random.randint(0, self.M + 2, size=self.K)
         offload_ratio = np.random.uniform(0, 1, size=self.K)
         uav_actions = np.random.uniform(0, 1, size=(self.M, self.uav_action_dim))
         mu_actions_env = {'association': association, 'offload_ratio': offload_ratio}
@@ -2833,7 +3320,7 @@ class ABMAPPO:
         jain_fairness_sum = 0.0
         delay_violation_sum = 0.0
 
-        for t in range(cfg.EPISODE_LENGTH):
+        for t in range(self.rollout_length):
             state = self.env.get_state()
             (mu_act_env, uav_act_env, mu_act_store, uav_act_store,
              mu_lp, uav_lp, mu_val, uav_val) = self.get_actions_and_values(obs, state=state)
@@ -2843,10 +3330,14 @@ class ABMAPPO:
             # 归一化奖励
             mu_r = rewards['mu_rewards']
             uav_r = rewards['uav_rewards']
-            self.mu_reward_rms.update(mu_r)
-            self.uav_reward_rms.update(uav_r)
-            mu_r_norm = self.mu_reward_rms.normalize(mu_r)
-            uav_r_norm = self.uav_reward_rms.normalize(uav_r)
+            if self.normalize_reward:
+                self.mu_reward_rms.update(mu_r)
+                self.uav_reward_rms.update(uav_r)
+                mu_r_norm = self.mu_reward_rms.normalize(mu_r)
+                uav_r_norm = self.uav_reward_rms.normalize(uav_r)
+            else:
+                mu_r_norm = mu_r
+                uav_r_norm = uav_r
 
             self.buffer.add(
                 mu_obs=obs['mu_obs'], mu_action=mu_act_store,
@@ -2868,7 +3359,10 @@ class ABMAPPO:
             steps += 1
             obs = next_obs
             if done:
-                obs = self.env.reset()
+                if self.rollout_mode == "fixed":
+                    obs = self.env.reset()
+                else:
+                    break
 
         mu_last, uav_last = self.get_values(obs)
         self.buffer.compute_gae(mu_last, uav_last)
@@ -2881,6 +3375,7 @@ class ABMAPPO:
             'mu_reward': raw_mu_r,
             'uav_reward': raw_uav_r,
             'total_cost': -(raw_mu_r + raw_uav_r) / 2,
+            'collected_steps': steps,
             'weighted_energy': weighted_energy_sum / denom,
             'weighted_energy_mu_avg': weighted_energy_mu_avg_sum / denom,
             'weighted_energy_mu_total': weighted_energy_mu_total_sum / denom,
@@ -2902,6 +3397,7 @@ class ABMAPPO:
         uav_data = {k: (v.to(self.device) if torch.is_tensor(v) else v) for k, v in batches['uav'].items()}
         all_obs_t = None
         all_ret_t = None
+        all_old_t = None
         if self.use_attention:
             mu_obs_t = mu_data['observations']
             uav_obs_t = uav_data['observations']
@@ -2911,6 +3407,7 @@ class ABMAPPO:
             all_obs_t[:, :self.K, :self.env.mu_obs_dim] = mu_obs_t
             all_obs_t[:, self.K:, :self.env.uav_obs_dim] = uav_obs_t
             all_ret_t = torch.cat([mu_data['returns'], uav_data['returns']], dim=1)
+            all_old_t = torch.cat([mu_data['values'], uav_data['values']], dim=1)
 
         total_al, total_cl, total_ent = 0, 0, 0
 
@@ -2974,7 +3471,7 @@ class ABMAPPO:
 
             # ---- Critic ----
             if self.use_attention:
-                cl = self._update_attention_critic(all_obs_t, all_ret_t)
+                cl = self._update_attention_critic(all_obs_t, all_ret_t, all_old_t)
             else:
                 cl = self._update_mlp_critic(mu_data, uav_data)
 
@@ -2987,10 +3484,19 @@ class ABMAPPO:
         n = cfg.PPO_EPOCHS
         return {'actor_loss': total_al/n, 'critic_loss': total_cl/n, 'entropy': total_ent/n}
 
-    def _update_attention_critic(self, all_obs, all_ret):
+    def _critic_value_loss(self, values: torch.Tensor, returns: torch.Tensor, old_values: torch.Tensor) -> torch.Tensor:
+        if bool(cfg.USE_VALUE_CLIP):
+            clip_eps = float(cfg.VALUE_CLIP_EPS)
+            clipped = old_values + torch.clamp(values - old_values, -clip_eps, clip_eps)
+            loss_unclipped = (values - returns) ** 2
+            loss_clipped = (clipped - returns) ** 2
+            return 0.5 * torch.max(loss_unclipped, loss_clipped).mean()
+        return 0.5 * ((values - returns) ** 2).mean()
+
+    def _update_attention_critic(self, all_obs, all_ret, all_old):
         with self._autocast_ctx():
             values = self.critic(all_obs).squeeze(-1)
-            loss = 0.5 * ((values - all_ret) ** 2).mean()
+            loss = self._critic_value_loss(values, all_ret, all_old)
 
         self.critic_optimizer.zero_grad(set_to_none=True)
         self.scaler.scale(loss).backward()
@@ -3000,9 +3506,8 @@ class ABMAPPO:
         return float(loss.item())
 
     def _update_mlp_critic(self, mu_data, uav_data):
-        mu_ret = mu_data['returns'].mean(dim=1, keepdim=True)
-        uav_ret = uav_data['returns'].mean(dim=1, keepdim=True)
-        avg_ret = (mu_ret + uav_ret) / 2
+        all_ret = torch.cat([mu_data['returns'], uav_data['returns']], dim=1)
+        all_old = torch.cat([mu_data['values'], uav_data['values']], dim=1)
 
         if 'states' not in mu_data or 'states' not in uav_data:
             raise KeyError("MLP critic update requires `states` in both MU and UAV batches")
@@ -3023,7 +3528,7 @@ class ABMAPPO:
 
         with self._autocast_ctx():
             values = self.critic(state)
-            loss = 0.5 * ((values - avg_ret) ** 2).mean()
+            loss = self._critic_value_loss(values, all_ret, all_old)
 
         self.critic_optimizer.zero_grad(set_to_none=True)
         self.scaler.scale(loss).backward()
@@ -3273,27 +3778,48 @@ class AttentionCritic(nn.Module):
     注意力机制Critic (论文 "A" 部分, 公式49-50)
 
     结构:
-      1. 每个智能体的观测 → Encoder MLP → 特征向量 e_i
+      1. MU/UAV 观测分别通过独立Encoder得到特征 e_i
       2. 多头注意力: Q=W_q*e_i, K=W_key*e_j, V=W_v*e_j
-         α_{i,j} = softmax(K^T * Q / √d_key)
+         α_{i,j} = softmax(K^T * Q / √d_key), 且 j != i（屏蔽对角）
          x_i = Σ α_{i,j} * V_j
-      3. [x_i, o_i] → MLP → V(s)
+      3. [x_i, e_i] → MLP → V_i
     """
 
-    def __init__(self, obs_dim, num_agents, num_heads=None):
+    def __init__(
+        self,
+        obs_dim,
+        num_agents,
+        num_mus,
+        num_uavs,
+        mu_obs_dim,
+        uav_obs_dim,
+        num_heads=None,
+    ):
         super().__init__()
         hidden = cfg.HIDDEN_SIZE
         self.num_agents = num_agents
+        self.num_mus = num_mus
+        self.num_uavs = num_uavs
+        self.mu_obs_dim = mu_obs_dim
+        self.uav_obs_dim = uav_obs_dim
         self.num_heads = num_heads or cfg.NUM_ATTENTION_HEADS
         self.head_dim = hidden // self.num_heads
+        if self.num_mus + self.num_uavs != self.num_agents:
+            raise ValueError("num_agents must equal num_mus + num_uavs")
+        if self.head_dim * self.num_heads != hidden:
+            raise ValueError("HIDDEN_SIZE must be divisible by num_heads")
 
-        # 观测编码器
-        self.encoder = nn.Sequential(
-            nn.Linear(obs_dim, hidden),
-            nn.ReLU(),
-            nn.Linear(hidden, hidden),
-            nn.ReLU(),
-        )
+        def _build_encoder(in_dim):
+            return nn.Sequential(
+                nn.Linear(in_dim, hidden),
+                nn.ReLU(),
+                nn.Linear(hidden, hidden),
+                nn.ReLU(),
+            )
+
+        # Distinct encoders for heterogeneous agent observation spaces.
+        self.mu_encoder = _build_encoder(self.mu_obs_dim)
+        self.uav_encoder = _build_encoder(self.uav_obs_dim)
 
         # 注意力 Q, K, V 变换 (公式49-50)
         self.W_query = nn.Linear(hidden, hidden, bias=False)
@@ -3307,6 +3833,12 @@ class AttentionCritic(nn.Module):
             nn.Linear(hidden, 1),
         )
 
+        # Mask diagonal attention so each agent only attends to others (j != i).
+        attn_bias = torch.zeros((1, 1, self.num_agents, self.num_agents), dtype=torch.float32)
+        diag_idx = torch.arange(self.num_agents)
+        attn_bias[:, :, diag_idx, diag_idx] = float("-inf")
+        self.register_buffer("attn_bias", attn_bias, persistent=False)
+
     def forward(self, all_obs, agent_idx=None):
         """
         Args:
@@ -3319,10 +3851,20 @@ class AttentionCritic(nn.Module):
         batch_size = all_obs.shape[0]
         N = self.num_agents
 
-        # 编码所有观测
-        obs_flat = all_obs.reshape(batch_size * N, -1)
-        features = self.encoder(obs_flat)  # (B*N, hidden)
-        features = features.reshape(batch_size, N, -1)  # (B, N, hidden)
+        # Encode MU/UAV observations with dedicated encoders.
+        if self.num_mus > 0:
+            mu_obs = all_obs[:, : self.num_mus, : self.mu_obs_dim].reshape(batch_size * self.num_mus, self.mu_obs_dim)
+            mu_features = self.mu_encoder(mu_obs).reshape(batch_size, self.num_mus, -1)
+        else:
+            mu_features = all_obs.new_zeros((batch_size, 0, cfg.HIDDEN_SIZE))
+        if self.num_uavs > 0:
+            uav_obs = all_obs[:, self.num_mus :, : self.uav_obs_dim].reshape(
+                batch_size * self.num_uavs, self.uav_obs_dim
+            )
+            uav_features = self.uav_encoder(uav_obs).reshape(batch_size, self.num_uavs, -1)
+        else:
+            uav_features = all_obs.new_zeros((batch_size, 0, cfg.HIDDEN_SIZE))
+        features = torch.cat([mu_features, uav_features], dim=1)
 
         # 多头注意力
         Q = self.W_query(features)  # (B, N, hidden)
@@ -3334,17 +3876,20 @@ class AttentionCritic(nn.Module):
         K = K.reshape(batch_size, N, self.num_heads, self.head_dim).transpose(1, 2)
         V = V.reshape(batch_size, N, self.num_heads, self.head_dim).transpose(1, 2)
 
+        attn_bias = self.attn_bias.to(device=Q.device, dtype=Q.dtype)
         # 优先使用 PyTorch 融合注意力算子；旧版本回退到手写实现。
         if hasattr(F, "scaled_dot_product_attention"):
             attn_output = F.scaled_dot_product_attention(
                 Q.contiguous(),
                 K.contiguous(),
                 V.contiguous(),
+                attn_mask=attn_bias,
                 dropout_p=0.0,
             )
         else:
             scale = float(self.head_dim) ** 0.5
             attn_scores = torch.matmul(Q, K.transpose(-2, -1)) / scale  # (B, heads, N, N)
+            attn_scores = attn_scores + attn_bias
             attn_weights = F.softmax(attn_scores, dim=-1)
             attn_output = torch.matmul(attn_weights, V)  # (B, heads, N, head_dim)
         attn_output = attn_output.transpose(1, 2).reshape(batch_size, N, -1)  # (B, N, hidden)
@@ -3367,13 +3912,14 @@ class MLPCritic(nn.Module):
     def __init__(self, obs_dim, num_agents=None):
         super().__init__()
         hidden = cfg.HIDDEN_SIZE
+        out_dim = int(num_agents) if num_agents is not None else 1
         # 输入: 全局状态或拼接观测
         self.net = nn.Sequential(
             nn.Linear(obs_dim, hidden),
             nn.ReLU(),
             nn.Linear(hidden, hidden),
             nn.ReLU(),
-            nn.Linear(hidden, 1),
+            nn.Linear(hidden, out_dim),
         )
 
     def forward(self, state, agent_idx=None):
@@ -3453,18 +3999,34 @@ from __future__ import annotations
 import argparse
 from datetime import datetime
 import json
+import math
 import os
+import re
 import subprocess
 import sys
 import time
 import uuid
 
+from experiment_validator import validate_experiment_outputs
 from train_sweep import RunOptions, build_run_specs
 
 
 FULL_SEEDS = "42,43,44"
 FULL_TOTAL_STEPS = 80000
 FULL_EPISODE_LENGTH = 300
+CUDA_PARALLEL_HARD_CAP = 12
+CUDA_RESERVE_GB = 1.5
+CUDA_MEM_PER_JOB_GB = 0.35
+# CPU mode: cap parallel to leave headroom for OS and prevent OOM-kill
+CPU_RAM_RESERVE_GB = 4.0
+CPU_RAM_PER_JOB_GB = 0.8
+CPU_HEAVY_MU_THRESHOLD = 100
+CPU_HEAVY_PARALLEL_HARD_CAP = 12
+CUDA_OOM_KEYWORDS = (
+    "cuda out of memory",
+    "cuda error: out of memory",
+    "cublas_status_alloc_failed",
+)
 
 
 def _run(cmd):
@@ -3541,14 +4103,24 @@ def _run_parallel_commands(
     job_timeout_sec=0.0,
     poll_interval_sec=0.2,
     threads_per_proc=None,
+    heavy_parallel_limit=None,
 ):
-    pending = list(job_specs)
+    pending = [_normalize_job_spec(spec) for spec in job_specs]
     active = []
 
     while pending or active:
         while pending and len(active) < max_parallel:
-            name, cmd = pending.pop(0)
-            active.append(_spawn_logged_process(name, cmd, log_dir, threads_per_proc=threads_per_proc))
+            next_job = _pop_next_schedulable_job(pending, active, heavy_parallel_limit)
+            if next_job is None:
+                break
+            spawned = _spawn_logged_process(
+                next_job["name"],
+                next_job["cmd"],
+                log_dir,
+                threads_per_proc=threads_per_proc,
+            )
+            spawned["is_heavy"] = bool(next_job.get("is_heavy", False))
+            active.append(spawned)
 
         if not active:
             continue
@@ -3627,11 +4199,117 @@ def _is_cuda_device(device):
     return "cuda" in str(device).lower()
 
 
+def _resolve_cuda_device_for_query(full_device):
+    device_str = str(full_device).lower()
+    if ":" in device_str:
+        suffix = device_str.split(":", 1)[1].strip()
+        if suffix.isdigit():
+            return int(suffix)
+    return None
+
+
+def _estimate_cuda_parallel(max_parallel, full_device):
+    try:
+        import torch
+    except Exception:
+        return 1, None, None
+
+    try:
+        if not torch.cuda.is_available():
+            return 1, None, None
+
+        device_idx = _resolve_cuda_device_for_query(full_device)
+        if device_idx is None:
+            free_bytes, total_bytes = torch.cuda.mem_get_info()
+        else:
+            free_bytes, total_bytes = torch.cuda.mem_get_info(device_idx)
+
+        free_gb = float(free_bytes) / float(1024**3)
+        total_gb = float(total_bytes) / float(1024**3)
+        available_gb = max(0.0, free_gb - float(CUDA_RESERVE_GB))
+        mem_jobs = int(math.floor(available_gb / float(CUDA_MEM_PER_JOB_GB)))
+        effective = max(
+            1,
+            min(
+                int(max_parallel),
+                int(CUDA_PARALLEL_HARD_CAP),
+                mem_jobs,
+            ),
+        )
+        return effective, free_gb, total_gb
+    except Exception:
+        return 1, None, None
+
+
+def _estimate_cpu_parallel(max_parallel):
+    """Estimate safe CPU parallel count from available RAM and core count."""
+    requested = max(1, int(max_parallel))
+    cpu_count = os.cpu_count() or 1
+    # Each job is single-threaded NumPy, so cap by core count
+    by_cores = cpu_count
+    free_gb = _read_mem_available_gb()
+    if free_gb is not None:
+        available_gb = max(0.0, free_gb - CPU_RAM_RESERVE_GB)
+        by_ram = int(math.floor(available_gb / CPU_RAM_PER_JOB_GB))
+        return max(1, min(requested, by_cores, by_ram)), free_gb
+    return max(1, min(requested, by_cores)), None
+
+
+def _read_mem_available_gb():
+    mem_info_path = "/proc/meminfo"
+    if not os.path.exists(mem_info_path):
+        return None
+    try:
+        with open(mem_info_path, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return float(line.split()[1]) / (1024 * 1024)
+    except Exception:
+        return None
+    return None
+
+
 def _effective_parallel(max_parallel, full_device):
-    return 1 if _is_cuda_device(full_device) else max(1, int(max_parallel))
+    if _is_cuda_device(full_device):
+        effective, _, _ = _estimate_cuda_parallel(max_parallel, full_device)
+        return effective
+    effective, _ = _estimate_cpu_parallel(max_parallel)
+    return effective
 
 
-def _summary_matches(summary_path, total_steps, episode_length):
+def _extract_log_path(error_text):
+    match = re.search(r"log=([^\s]+)", str(error_text))
+    if not match:
+        return None
+    return match.group(1)
+
+
+def _read_log_tail(log_path, max_bytes=65536):
+    if not log_path or not os.path.exists(log_path):
+        return ""
+    try:
+        with open(log_path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            seek_pos = max(0, size - max_bytes)
+            f.seek(seek_pos, os.SEEK_SET)
+            return f.read().decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
+
+
+def _is_oom_failure(error_text):
+    combined = str(error_text).lower()
+    # Linux OOM killer sends SIGKILL (-9)
+    if "failed with code -9" in combined:
+        return True
+    log_path = _extract_log_path(error_text)
+    if log_path:
+        combined += "\n" + _read_log_tail(log_path).lower()
+    return any(keyword in combined for keyword in CUDA_OOM_KEYWORDS)
+
+
+def _summary_matches(summary_path, total_steps, episode_length, paper_mode=False):
     if not os.path.exists(summary_path):
         return False
     try:
@@ -3641,7 +4319,11 @@ def _summary_matches(summary_path, total_steps, episode_length):
         return False
     same_steps = int(summary.get("total_steps", -1)) == int(total_steps)
     same_epl = int(summary.get("episode_length", -1)) == int(episode_length)
-    return same_steps and same_epl
+    if not (same_steps and same_epl):
+        return False
+    if paper_mode:
+        return bool(summary.get("paper_mode", False))
+    return True
 
 
 def _append_override_arg(cmd, key, value):
@@ -3677,7 +4359,7 @@ def _build_train_cmd_from_spec(run_spec, full_device, total_steps, episode_lengt
     return cmd
 
 
-def _build_run_job_specs(full_device, total_steps, episode_length):
+def _build_run_job_specs(full_device, total_steps, episode_length, paper_mode=False):
     options = RunOptions(
         seeds=[42, 43, 44],
         device=full_device,
@@ -3687,12 +4369,13 @@ def _build_run_job_specs(full_device, total_steps, episode_length):
         skip_existing=False,
         disable_tensorboard=True,
         smoke=False,
+        paper_mode=bool(paper_mode),
     )
     all_specs = build_run_specs("all", options)
     pending_specs = []
 
     for spec in all_specs:
-        if _summary_matches(spec["summary_path"], total_steps, episode_length):
+        if _summary_matches(spec["summary_path"], total_steps, episode_length, paper_mode=paper_mode):
             print(
                 f"[skip] fig={spec['fig']} algo={spec['algorithm']} "
                 f"{spec['setting_name']} seed={spec['seed']}"
@@ -3709,57 +4392,162 @@ def _build_run_job_specs(full_device, total_steps, episode_length):
     for spec in pending_specs:
         name = f"fig{spec['fig']}_{spec['algorithm']}_{spec['setting_name']}_seed{spec['seed']}"
         cmd = _build_train_cmd_from_spec(spec, full_device, total_steps, episode_length)
-        job_specs.append((name, cmd))
+        is_heavy = int(spec.get("num_mus", 0)) >= CPU_HEAVY_MU_THRESHOLD
+        job_specs.append((name, cmd, {"is_heavy": bool(is_heavy)}))
     return job_specs
 
 
-def run_full(max_parallel=3, full_device="cpu", job_timeout_sec=0.0):
+def _normalize_job_spec(job_spec):
+    if isinstance(job_spec, dict):
+        return {
+            "name": str(job_spec["name"]),
+            "cmd": list(job_spec["cmd"]),
+            "is_heavy": bool(job_spec.get("is_heavy", False)),
+        }
+
+    if not isinstance(job_spec, (tuple, list)):
+        raise TypeError(f"Unsupported job spec type: {type(job_spec)}")
+
+    if len(job_spec) < 2:
+        raise ValueError("Job spec tuple/list must contain at least (name, cmd)")
+
+    name = str(job_spec[0])
+    cmd = list(job_spec[1])
+    is_heavy = False
+    if len(job_spec) >= 3:
+        meta = job_spec[2]
+        if isinstance(meta, dict):
+            is_heavy = bool(meta.get("is_heavy", False))
+        else:
+            is_heavy = bool(meta)
+
+    return {"name": name, "cmd": cmd, "is_heavy": is_heavy}
+
+
+def _count_active_heavy(active_jobs):
+    return sum(1 for job in active_jobs if bool(job.get("is_heavy", False)))
+
+
+def _pop_next_schedulable_job(pending_jobs, active_jobs, heavy_parallel_limit):
+    if not pending_jobs:
+        return None
+
+    if heavy_parallel_limit is None:
+        return pending_jobs.pop(0)
+
+    heavy_limit = max(1, int(heavy_parallel_limit))
+    heavy_active = _count_active_heavy(active_jobs)
+    for idx, job in enumerate(pending_jobs):
+        if not job.get("is_heavy", False):
+            return pending_jobs.pop(idx)
+        if heavy_active < heavy_limit:
+            return pending_jobs.pop(idx)
+    return None
+
+
+def run_full(max_parallel=3, full_device="cpu", job_timeout_sec=0.0, paper_mode=False):
     log_dir = _build_full_log_dir("run_logs")
-    effective_parallel = _effective_parallel(max_parallel, full_device)
     cpu_count = os.cpu_count() or 1
-    threads_per_proc = max(1, cpu_count // max(1, effective_parallel))
-    job_specs = _build_run_job_specs(
-        full_device=full_device,
-        total_steps=FULL_TOTAL_STEPS,
-        episode_length=FULL_EPISODE_LENGTH,
-    )
+    forced_parallel = None
+    attempt = 0
 
     print("[run_logs]", log_dir)
-    print(
-        f"[full] device={full_device} requested_parallel={max_parallel} "
-        f"effective_parallel={effective_parallel} threads_per_proc={threads_per_proc} "
-        f"pending_jobs={len(job_specs)}"
-    )
-    if job_specs:
-        _run_parallel_commands(
-            job_specs,
-            max_parallel=effective_parallel,
-            log_dir=log_dir,
-            job_timeout_sec=job_timeout_sec,
-            threads_per_proc=threads_per_proc,
-        )
-    else:
-        print("[full] no pending training jobs, continue to aggregation")
+    while True:
+        attempt += 1
 
-    _run(
-        [
-            sys.executable,
-            "train_sweep.py",
-            "--fig",
-            "all",
-            "--seeds",
-            FULL_SEEDS,
-            "--total_steps",
-            str(FULL_TOTAL_STEPS),
-            "--episode_length",
-            str(FULL_EPISODE_LENGTH),
-            "--resume",
-            "--skip_existing",
-            "--disable_tensorboard",
-            "--device",
-            full_device,
-        ]
+        if _is_cuda_device(full_device):
+            suggested_parallel, gpu_free_gb, gpu_total_gb = _estimate_cuda_parallel(max_parallel, full_device)
+            cpu_free_gb = None
+            heavy_parallel_limit = None
+            if forced_parallel is None:
+                effective_parallel = suggested_parallel
+            else:
+                effective_parallel = max(1, min(suggested_parallel, forced_parallel))
+            threads_per_proc = max(1, cpu_count // max(1, effective_parallel))
+        else:
+            suggested_parallel, cpu_free_gb = _estimate_cpu_parallel(max_parallel)
+            heavy_parallel_limit = max(1, min(int(CPU_HEAVY_PARALLEL_HARD_CAP), int(suggested_parallel)))
+            if forced_parallel is None:
+                effective_parallel = suggested_parallel
+            else:
+                effective_parallel = max(1, min(suggested_parallel, forced_parallel))
+            gpu_free_gb = None
+            gpu_total_gb = None
+            # CPU path is environment-step bound; force 1 thread/proc to avoid BLAS oversubscription.
+            threads_per_proc = 1
+        job_specs = _build_run_job_specs(
+            full_device=full_device,
+            total_steps=FULL_TOTAL_STEPS,
+            episode_length=FULL_EPISODE_LENGTH,
+            paper_mode=paper_mode,
+        )
+
+        gpu_free_text = f"{gpu_free_gb:.2f}" if gpu_free_gb is not None else "n/a"
+        gpu_total_text = f"{gpu_total_gb:.2f}" if gpu_total_gb is not None else "n/a"
+        cpu_free_text = f"{cpu_free_gb:.2f}" if cpu_free_gb is not None else "n/a"
+        heavy_limit_text = str(heavy_parallel_limit) if heavy_parallel_limit is not None else "n/a"
+        print(
+            f"[full] attempt={attempt} device={full_device} requested_parallel={max_parallel} "
+            f"effective_parallel={effective_parallel} threads_per_proc={threads_per_proc} "
+            f"pending_jobs={len(job_specs)} gpu_free_gb={gpu_free_text} gpu_total_gb={gpu_total_text} "
+            f"cpu_mem_available_gb={cpu_free_text} heavy_parallel_limit={heavy_limit_text}"
+        )
+
+        if not job_specs:
+            print("[full] no pending training jobs, continue to aggregation")
+            break
+
+        try:
+            _run_parallel_commands(
+                job_specs,
+                max_parallel=effective_parallel,
+                log_dir=log_dir,
+                job_timeout_sec=job_timeout_sec,
+                threads_per_proc=threads_per_proc,
+                heavy_parallel_limit=heavy_parallel_limit,
+            )
+            break
+        except RuntimeError as exc:
+            if effective_parallel > 1 and _is_oom_failure(str(exc)):
+                next_parallel = max(1, effective_parallel // 2)
+                if next_parallel == effective_parallel:
+                    next_parallel = max(1, effective_parallel - 1)
+                forced_parallel = next_parallel
+                print(
+                    f"[full][retry] OOM detected (code -9 or CUDA OOM), reducing parallel "
+                    f"{effective_parallel} -> {forced_parallel}"
+                )
+                continue
+            raise
+
+    aggregate_cmd = [
+        sys.executable,
+        "train_sweep.py",
+        "--fig",
+        "all",
+        "--seeds",
+        FULL_SEEDS,
+        "--total_steps",
+        str(FULL_TOTAL_STEPS),
+        "--episode_length",
+        str(FULL_EPISODE_LENGTH),
+        "--resume",
+        "--skip_existing",
+        "--disable_tensorboard",
+        "--device",
+        full_device,
+    ]
+    if paper_mode:
+        aggregate_cmd.append("--paper_mode")
+    _run(aggregate_cmd)
+    validate_experiment_outputs(
+        total_steps=FULL_TOTAL_STEPS,
+        episode_length=FULL_EPISODE_LENGTH,
+        seeds=[int(s.strip()) for s in str(FULL_SEEDS).split(",") if s.strip()],
+        fig="all",
+        paper_mode=bool(paper_mode),
     )
+    print("[full] experiment data validation passed")
 
     _run([sys.executable, "generate_figures.py", "--figs", "all"])
 
@@ -3775,6 +4563,11 @@ def parse_args():
         default=0.0,
         help="timeout per full-stage job in seconds (0 disables timeout)",
     )
+    p.add_argument(
+        "--paper_mode",
+        action="store_true",
+        help="Enable paper-aligned training preset across full-stage runs.",
+    )
     return p.parse_args()
 
 
@@ -3787,6 +4580,7 @@ def main():
             max_parallel=max(1, args.max_parallel),
             full_device=args.full_device,
             job_timeout_sec=max(0.0, float(args.job_timeout_sec)),
+            paper_mode=bool(args.paper_mode),
         )
     else:
         run_smoke()
@@ -3794,7 +4588,84 @@ def main():
             max_parallel=max(1, args.max_parallel),
             full_device=args.full_device,
             job_timeout_sec=max(0.0, float(args.job_timeout_sec)),
+            paper_mode=bool(args.paper_mode),
         )
+
+
+if __name__ == "__main__":
+    main()
+```
+
+## scripts/generate_current_modules_code.py
+
+```python
+#!/usr/bin/env python3
+"""
+Generate docs/current_modules_code.md deterministically.
+
+Collects all non-test Python modules in repo, sorted by relative path.
+"""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+
+EXCLUDE_PARTS = {
+    ".git",
+    ".venv",
+    ".pytest_cache",
+    "__pycache__",
+    "tests",
+}
+
+
+def _iter_python_modules(repo_root: Path):
+    for path in sorted(repo_root.rglob("*.py"), key=lambda p: p.as_posix()):
+        rel = path.relative_to(repo_root)
+        if any(part in EXCLUDE_PARTS for part in rel.parts):
+            continue
+        yield rel
+
+
+def build_markdown(repo_root: Path) -> str:
+    lines = [
+        "# 当前代码模块源码汇总",
+        "",
+        "> 说明：该文档由脚本自动生成，收录当前仓库中非 tests 的 Python 模块完整源码。",
+        "",
+    ]
+    for rel in _iter_python_modules(repo_root):
+        src = (repo_root / rel).read_text(encoding="utf-8")
+        lines.extend(
+            [
+                f"## {rel.as_posix()}",
+                "",
+                "```python",
+                src.rstrip("\n"),
+                "```",
+                "",
+            ]
+        )
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Generate docs/current_modules_code.md")
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("docs/current_modules_code.md"),
+        help="Output markdown path relative to repo root.",
+    )
+    args = parser.parse_args()
+
+    repo_root = Path(__file__).resolve().parents[1]
+    output_path = repo_root / args.output
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(build_markdown(repo_root), encoding="utf-8")
+    print(f"[saved] {output_path}")
 
 
 if __name__ == "__main__":
@@ -3850,6 +4721,47 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--dt_deviation", type=float, default=cfg.DT_DEVIATION_RATE)
     parser.add_argument("--wo_dt_noise_mode", action="store_true")
+    parser.add_argument(
+        "--paper_mode",
+        type=str,
+        default=cfg.PAPER_MODE,
+        choices=["on", "off"],
+        help="Enable paper-aligned preset overrides for observation/reward/rollout settings.",
+    )
+    parser.add_argument(
+        "--normalize_reward",
+        type=str,
+        default="on" if cfg.NORMALIZE_REWARD else "off",
+        choices=["on", "off"],
+        help="Enable/disable running reward normalization.",
+    )
+    parser.add_argument(
+        "--reward_scale",
+        type=float,
+        default=cfg.REWARD_SCALE,
+        help="Override global REWARD_SCALE without changing source config.",
+    )
+    parser.add_argument(
+        "--uav_obs_mask_mode",
+        type=str,
+        default=cfg.UAV_OBS_MASK_MODE,
+        choices=["none", "prev_assoc"],
+        help="UAV observation mask mode.",
+    )
+    parser.add_argument(
+        "--rollout_mode",
+        type=str,
+        default=cfg.ROLLOUT_MODE,
+        choices=["fixed", "env_episode"],
+        help="Rollout collection mode for MAPPO-family agents.",
+    )
+    parser.add_argument(
+        "--bs_relay_policy",
+        type=str,
+        default=cfg.BS_RELAY_POLICY,
+        choices=["nearest", "best_snr", "min_load"],
+        help="Relay-UAV selection policy when MU chooses BS relay action (M+1).",
+    )
 
     # optional config overrides
     parser.add_argument("--bandwidth_mhz", type=float, default=None)
@@ -3894,6 +4806,7 @@ def _set_random_seed(seed):
 
 def _build_cfg_overrides(args):
     overrides = {"EPISODE_LENGTH": args.episode_length}
+    overrides["REWARD_SCALE"] = float(args.reward_scale)
     if args.bandwidth_mhz is not None:
         overrides["BANDWIDTH"] = args.bandwidth_mhz * 1e6
     if args.weight_factor is not None:
@@ -3926,12 +4839,49 @@ def _temporary_cfg(overrides):
             setattr(cfg, key, value)
 
 
-def _make_agent(env, algorithm, device):
+def _normalize_reward_flag(value):
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"on", "true", "1", "yes"}
+
+
+def _paper_mode_flag(value):
+    return str(value).strip().lower() in {"on", "true", "1", "yes"}
+
+
+def _apply_paper_mode_preset(args):
+    """Mutate args in-place with paper-aligned defaults when paper_mode is enabled."""
+    enabled = _paper_mode_flag(getattr(args, "paper_mode", "off"))
+    args.paper_mode = "on" if enabled else "off"
+    if not enabled:
+        return args
+
+    args.normalize_reward = "on" if bool(cfg.PAPER_PROFILE_NORMALIZE_REWARD) else "off"
+    args.reward_scale = float(cfg.PAPER_PROFILE_REWARD_SCALE)
+    args.uav_obs_mask_mode = str(cfg.PAPER_PROFILE_UAV_OBS_MASK_MODE)
+    args.rollout_mode = str(cfg.PAPER_PROFILE_ROLLOUT_MODE)
+    args.bs_relay_policy = str(cfg.PAPER_PROFILE_BS_RELAY_POLICY)
+    return args
+
+
+def _make_agent(env, algorithm, device, normalize_reward=True, rollout_mode=cfg.ROLLOUT_MODE):
     if algorithm == "MADDPG":
         return MADDPG(env, device=device)
     if algorithm == "Randomized":
-        return ABMAPPO(env, algorithm="Randomized", device=device)
-    return ABMAPPO(env, algorithm=algorithm, device=device)
+        return ABMAPPO(
+            env,
+            algorithm="Randomized",
+            device=device,
+            normalize_reward=normalize_reward,
+            rollout_mode=rollout_mode,
+        )
+    return ABMAPPO(
+        env,
+        algorithm=algorithm,
+        device=device,
+        normalize_reward=normalize_reward,
+        rollout_mode=rollout_mode,
+    )
 
 
 def _history_schema():
@@ -3985,6 +4935,12 @@ def _build_summary(args, history):
         "num_uavs": int(args.num_uavs),
         "total_steps": int(args.total_steps),
         "episode_length": int(args.episode_length),
+        "paper_mode": bool(_paper_mode_flag(args.paper_mode)),
+        "normalize_reward": bool(_normalize_reward_flag(args.normalize_reward)),
+        "reward_scale": float(args.reward_scale),
+        "uav_obs_mask_mode": str(args.uav_obs_mask_mode),
+        "rollout_mode": str(args.rollout_mode),
+        "bs_relay_policy": str(args.bs_relay_policy),
         "tail_metrics": tail,
         "num_episodes": int(len(history["episode"])),
         "tag": args.tag,
@@ -3993,6 +4949,7 @@ def _build_summary(args, history):
 
 def train(args):
     args.algorithm = _canonical_algo_name(args.algorithm)
+    args = _apply_paper_mode_preset(args)
     _set_random_seed(args.seed)
     device = setup_device(args.device)
 
@@ -4031,11 +4988,19 @@ def train(args):
             num_uavs=args.num_uavs,
             dt_deviation_rate=args.dt_deviation,
             wo_dt_noise_mode=args.wo_dt_noise_mode,
+            uav_obs_mask_mode=args.uav_obs_mask_mode,
+            bs_relay_policy=args.bs_relay_policy,
             area_width=args.area_width,
             area_height=args.area_height,
             seed=args.seed,
         )
-        agent = _make_agent(env, args.algorithm, device)
+        agent = _make_agent(
+            env,
+            args.algorithm,
+            device,
+            normalize_reward=_normalize_reward_flag(args.normalize_reward),
+            rollout_mode=args.rollout_mode,
+        )
 
         writer = None
         if not args.disable_tensorboard:
@@ -4047,16 +5012,25 @@ def train(args):
             except Exception:
                 writer = None
 
-        total_episodes = max(1, args.total_steps // args.episode_length)
+        target_steps = max(1, int(args.total_steps))
+        nominal_episode_len = max(1, int(args.episode_length))
+        estimated_total_episodes = max(1, int(np.ceil(target_steps / float(nominal_episode_len))))
         history = _history_schema()
 
         best_metric = float("inf")
         start_time = time.time()
+        episode = 0
+        step = 0
+        last_log_step = -1
 
-        for episode in range(1, total_episodes + 1):
+        while step < target_steps:
+            episode += 1
             episode_stats = agent.collect_episode()
             update_stats = agent.update()
-            step = episode * args.episode_length
+            collected_steps = int(episode_stats.get("collected_steps", nominal_episode_len))
+            if collected_steps <= 0:
+                collected_steps = nominal_episode_len
+            step = min(target_steps, step + collected_steps)
 
             history["episode"].append(episode)
             history["step"].append(step)
@@ -4086,12 +5060,14 @@ def train(args):
                 writer.add_scalar("Loss/Critic", history["critic_loss"][-1], step)
                 writer.add_scalar("Exploration/EntropyOrNoise", history["entropy"][-1], step)
 
-            should_log = (episode == 1) or (episode % max(1, total_episodes // 20) == 0)
+            log_stride = max(1, target_steps // 20)
+            should_log = (episode == 1) or (step >= target_steps) or (step - last_log_step >= log_stride)
             if should_log:
+                last_log_step = step
                 elapsed = max(1e-6, time.time() - start_time)
                 eps_per_sec = episode / elapsed
                 print(
-                    f"ep={episode:4d}/{total_episodes} step={step:7d} "
+                    f"ep={episode:4d}/{estimated_total_episodes} step={step:7d}/{target_steps} "
                     f"mu_r={history['mu_reward'][-1]:8.4f} uav_r={history['uav_reward'][-1]:8.4f} "
                     f"wE={history['weighted_energy_mu_avg'][-1]:8.4f} fairness={history['jain_fairness'][-1]:6.3f} "
                     f"viol={history['delay_violation'][-1]:6.3f} eps/s={eps_per_sec:5.2f}"
@@ -4136,6 +5112,12 @@ def namespace_from_kwargs(**kwargs):
         "seed": 42,
         "dt_deviation": cfg.DT_DEVIATION_RATE,
         "wo_dt_noise_mode": False,
+        "paper_mode": cfg.PAPER_MODE,
+        "normalize_reward": "on" if cfg.NORMALIZE_REWARD else "off",
+        "reward_scale": cfg.REWARD_SCALE,
+        "uav_obs_mask_mode": cfg.UAV_OBS_MASK_MODE,
+        "rollout_mode": cfg.ROLLOUT_MODE,
+        "bs_relay_policy": cfg.BS_RELAY_POLICY,
         "bandwidth_mhz": None,
         "weight_factor": None,
         "mu_max_cpu_ghz": None,
@@ -4227,6 +5209,7 @@ class RunOptions:
     skip_existing: bool
     disable_tensorboard: bool
     smoke: bool
+    paper_mode: bool = False
 
 
 def _build_run_specs_for_setting(fig, algorithm, setting_name, base_kwargs, options: RunOptions):
@@ -4237,6 +5220,9 @@ def _build_run_specs_for_setting(fig, algorithm, setting_name, base_kwargs, opti
     for seed in options.seeds:
         run_dir = os.path.join(cfg.EXPERIMENT_ROOT, fig_dir, algorithm, setting_name, f"seed_{seed}")
         summary_path = os.path.join(run_dir, "summary.json")
+        cli_overrides = dict(base_kwargs)
+        if bool(options.paper_mode):
+            cli_overrides["paper_mode"] = "on"
         specs.append(
             {
                 "fig": fig,
@@ -4246,7 +5232,7 @@ def _build_run_specs_for_setting(fig, algorithm, setting_name, base_kwargs, opti
                 "seed": int(seed),
                 "run_dir": run_dir,
                 "summary_path": summary_path,
-                "cli_overrides": dict(base_kwargs),
+                "cli_overrides": cli_overrides,
                 "num_mus": num_mus,
                 "num_uavs": num_uavs,
             }
@@ -4722,6 +5708,11 @@ def parse_args():
     parser.add_argument("--skip_existing", action="store_true")
     parser.add_argument("--disable_tensorboard", action="store_true")
     parser.add_argument("--smoke", action="store_true", help="small subset for fast pipeline validation")
+    parser.add_argument(
+        "--paper_mode",
+        action="store_true",
+        help="Enable paper-aligned train preset (normalize_reward=off, reward_scale=1.0, prev_assoc, env_episode, best_snr).",
+    )
     return parser.parse_args()
 
 
@@ -4740,6 +5731,7 @@ def main():
         skip_existing=args.skip_existing,
         disable_tensorboard=args.disable_tensorboard,
         smoke=args.smoke,
+        paper_mode=bool(args.paper_mode),
     )
 
     runners = {
@@ -4772,4 +5764,3 @@ def main():
 if __name__ == "__main__":
     main()
 ```
-

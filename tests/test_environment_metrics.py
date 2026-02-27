@@ -39,7 +39,7 @@ class TestEnvironmentMetrics(unittest.TestCase):
         self.assertIn("weighted_energy_mu_total", info)
         self.assertIn("weighted_energy_mu_avg", info)
 
-    def test_jain_fairness_matches_inverse_energy_definition(self):
+    def test_jain_fairness_matches_paper_energy_definition(self):
         env = UAVMECEnv(num_mus=8, num_uavs=2)
         env.reset()
         assoc = np.random.randint(0, 3, size=8)
@@ -47,9 +47,31 @@ class TestEnvironmentMetrics(unittest.TestCase):
         uav_act = np.random.uniform(0.0, 1.0, size=(2, env.uav_continuous_dim))
         _, _, _, info = env.step({"association": assoc, "offload_ratio": offload}, uav_act)
         mu_energy = info["mu_energy"]
-        utility = 1.0 / (mu_energy + 1e-8)
-        expected = float((utility.sum() ** 2) / (len(utility) * np.sum(utility**2) + 1e-8))
+        expected = float((mu_energy.sum() ** 2) / (len(mu_energy) * np.sum(mu_energy**2) + 1e-8))
         self.assertAlmostEqual(info["jain_fairness"], expected, places=6)
+
+    def test_jain_fairness_utility_legacy_field_present(self):
+        env = UAVMECEnv(num_mus=8, num_uavs=2)
+        env.reset()
+        assoc = np.random.randint(0, 3, size=8)
+        offload = np.random.uniform(0.0, 1.0, size=8)
+        uav_act = np.random.uniform(0.0, 1.0, size=(2, env.uav_continuous_dim))
+        _, _, _, info = env.step({"association": assoc, "offload_ratio": offload}, uav_act)
+        self.assertIn("jain_fairness_utility", info)
+        self.assertGreaterEqual(info["jain_fairness_utility"], 0.0)
+        self.assertLessEqual(info["jain_fairness_utility"], 1.0 + 1e-6)
+
+    def test_uav_reward_excludes_self_energy_when_coeff_is_zero(self):
+        env = UAVMECEnv(num_mus=2, num_uavs=1, seed=21)
+        env.reset()
+        association = np.array([0, 0], dtype=np.int64)
+        offload = np.array([0.0, 0.0], dtype=np.float32)
+        uav_action = np.zeros((env.M, env.uav_continuous_dim), dtype=np.float32)
+        with patch.object(cfg, "UAV_REWARD_SELF_ENERGY_COEFF", 0.0), patch.object(cfg, "PENALTY_BOUNDARY", 0.0), patch.object(
+            cfg, "PENALTY_COLLISION", 0.0
+        ), patch.object(cfg, "REWARD_SCALE", 1.0):
+            _, rewards, _, _ = env.step({"association": association, "offload_ratio": offload}, uav_action)
+        self.assertAlmostEqual(float(rewards["uav_rewards"][0]), 0.0, places=6)
 
     def test_wo_dt_noise_is_clipped(self):
         env = UAVMECEnv(num_mus=6, num_uavs=2, wo_dt_noise_mode=True)

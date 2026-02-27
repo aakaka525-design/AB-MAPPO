@@ -28,6 +28,22 @@ class TestTrainSweepRunSpecs(unittest.TestCase):
         self.assertEqual(by_fig["10"], 108)
         self.assertEqual(by_fig["11"], 72)
 
+    def test_paper_mode_injects_cli_override(self):
+        options = RunOptions(
+            seeds=[42],
+            device="cpu",
+            total_steps=4000,
+            episode_length=120,
+            resume=False,
+            skip_existing=False,
+            disable_tensorboard=True,
+            smoke=True,
+            paper_mode=True,
+        )
+        specs = build_run_specs("base", options)
+        self.assertGreater(len(specs), 0)
+        self.assertEqual(specs[0]["cli_overrides"].get("paper_mode"), "on")
+
 
 if __name__ == "__main__":
     unittest.main()

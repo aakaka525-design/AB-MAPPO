@@ -10,6 +10,7 @@ AB-MAPPO 论文复现 — 核心算法 (精确版)
 
 import os
 from contextlib import nullcontext
+import warnings
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -49,12 +50,25 @@ class RunningMeanStd:
         return (x - self.mean) / (np.sqrt(self.var) + 1e-8)
 
 class ABMAPPO:
-    def __init__(self, env: UAVMECEnv, algorithm='AB-MAPPO', device='cpu'):
+    def __init__(
+        self,
+        env: UAVMECEnv,
+        algorithm='AB-MAPPO',
+        device='cpu',
+        normalize_reward: bool = True,
+        rollout_mode: str = cfg.ROLLOUT_MODE,
+    ):
         self.env = env
         self.algorithm = algorithm
         self.device = torch.device(device)
         self.K = env.K
         self.M = env.M
+        self.normalize_reward = bool(normalize_reward)
+        self._warned_scalar_critic_output = False
+        if rollout_mode not in {"fixed", "env_episode"}:
+            raise ValueError("rollout_mode must be one of {'fixed', 'env_episode'}")
+        self.rollout_mode = rollout_mode
+        self.rollout_length = cfg.EPISODE_LENGTH if self.rollout_mode == "fixed" else int(self.env.max_steps)
 
         # 动作维度
         self.mu_action_dim = 2   # [discrete(1), offload_ratio(1)]
@@ -86,11 +100,15 @@ class ABMAPPO:
             self.critic = AttentionCritic(
                 obs_dim=self.critic_obs_dim,
                 num_agents=self.K + self.M,
+                num_mus=self.K,
+                num_uavs=self.M,
+                mu_obs_dim=env.mu_obs_dim,
+                uav_obs_dim=env.uav_obs_dim,
                 num_heads=cfg.NUM_ATTENTION_HEADS
             ).to(self.device)
         else:
             self.critic_obs_dim = env.state_dim
-            self.critic = MLPCritic(obs_dim=self.critic_obs_dim).to(self.device)
+            self.critic = MLPCritic(obs_dim=self.critic_obs_dim, num_agents=self.K + self.M).to(self.device)
 
         if hasattr(torch, "compile") and self.device.type == "cuda" and os.name != "nt":
             try:
@@ -117,7 +135,7 @@ class ABMAPPO:
             mu_obs_dim=env.mu_obs_dim, uav_obs_dim=env.uav_obs_dim,
             mu_action_dim=self.mu_action_dim,
             uav_action_dim=self.uav_action_dim,
-            buffer_size=cfg.EPISODE_LENGTH,
+            buffer_size=self.rollout_length,
             state_dim=env.state_dim,
         )
 
@@ -150,7 +168,7 @@ class ABMAPPO:
         mu_log_probs_np = mu_log_probs.cpu().numpy()
 
         association = mu_actions_np[:, 0].astype(int)
-        association = np.clip(association, 0, self.M)
+        association = np.clip(association, 0, self.M + 1)
         offload_ratio = np.clip(mu_actions_np[:, 1], 0, 1)
 
         # UAV动作 (2 + 2K 维)
@@ -197,9 +215,22 @@ class ABMAPPO:
     def _values_from_state(self, state: np.ndarray | None = None) -> Tuple[np.ndarray, np.ndarray]:
         state_np = self.env.get_state() if state is None else state
         state_t = torch.as_tensor(state_np, dtype=torch.float32, device=self.device).unsqueeze(0)
-        v = self.critic(state_t).item()
-        # MLP critic is a centralized scalar-value baseline; broadcast to all agents by design.
-        return np.full(self.K, v), np.full(self.M, v)
+        values = self.critic(state_t).squeeze(0).detach().cpu().numpy().reshape(-1)
+        if values.size == 1:
+            if not self._warned_scalar_critic_output:
+                warnings.warn(
+                    "MLP critic returned scalar value; broadcasting to all agents. "
+                    "Check critic output dimension configuration.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                self._warned_scalar_critic_output = True
+            v = float(values.item())
+            return np.full(self.K, v), np.full(self.M, v)
+        expected = self.K + self.M
+        if values.size != expected:
+            raise ValueError(f"MLP critic output size mismatch: expected {expected}, got {values.size}")
+        return values[: self.K], values[self.K :]
 
     @torch.no_grad()
     def get_actions(self, observations, deterministic=False):
@@ -210,7 +241,7 @@ class ABMAPPO:
         return self._actions_from_tensors(mu_obs, uav_obs, deterministic=deterministic)
 
     def _get_random_actions(self):
-        association = np.random.randint(0, self.M + 1, size=self.K)
+        association = np.random.randint(0, self.M + 2, size=self.K)
         offload_ratio = np.random.uniform(0, 1, size=self.K)
         uav_actions = np.random.uniform(0, 1, size=(self.M, self.uav_action_dim))
         mu_actions_env = {'association': association, 'offload_ratio': offload_ratio}
@@ -251,7 +282,7 @@ class ABMAPPO:
         jain_fairness_sum = 0.0
         delay_violation_sum = 0.0
 
-        for t in range(cfg.EPISODE_LENGTH):
+        for t in range(self.rollout_length):
             state = self.env.get_state()
             (mu_act_env, uav_act_env, mu_act_store, uav_act_store,
              mu_lp, uav_lp, mu_val, uav_val) = self.get_actions_and_values(obs, state=state)
@@ -261,10 +292,14 @@ class ABMAPPO:
             # 归一化奖励
             mu_r = rewards['mu_rewards']
             uav_r = rewards['uav_rewards']
-            self.mu_reward_rms.update(mu_r)
-            self.uav_reward_rms.update(uav_r)
-            mu_r_norm = self.mu_reward_rms.normalize(mu_r)
-            uav_r_norm = self.uav_reward_rms.normalize(uav_r)
+            if self.normalize_reward:
+                self.mu_reward_rms.update(mu_r)
+                self.uav_reward_rms.update(uav_r)
+                mu_r_norm = self.mu_reward_rms.normalize(mu_r)
+                uav_r_norm = self.uav_reward_rms.normalize(uav_r)
+            else:
+                mu_r_norm = mu_r
+                uav_r_norm = uav_r
 
             self.buffer.add(
                 mu_obs=obs['mu_obs'], mu_action=mu_act_store,
@@ -286,7 +321,10 @@ class ABMAPPO:
             steps += 1
             obs = next_obs
             if done:
-                obs = self.env.reset()
+                if self.rollout_mode == "fixed":
+                    obs = self.env.reset()
+                else:
+                    break
 
         mu_last, uav_last = self.get_values(obs)
         self.buffer.compute_gae(mu_last, uav_last)
@@ -299,6 +337,7 @@ class ABMAPPO:
             'mu_reward': raw_mu_r,
             'uav_reward': raw_uav_r,
             'total_cost': -(raw_mu_r + raw_uav_r) / 2,
+            'collected_steps': steps,
             'weighted_energy': weighted_energy_sum / denom,
             'weighted_energy_mu_avg': weighted_energy_mu_avg_sum / denom,
             'weighted_energy_mu_total': weighted_energy_mu_total_sum / denom,
@@ -320,6 +359,7 @@ class ABMAPPO:
         uav_data = {k: (v.to(self.device) if torch.is_tensor(v) else v) for k, v in batches['uav'].items()}
         all_obs_t = None
         all_ret_t = None
+        all_old_t = None
         if self.use_attention:
             mu_obs_t = mu_data['observations']
             uav_obs_t = uav_data['observations']
@@ -329,6 +369,7 @@ class ABMAPPO:
             all_obs_t[:, :self.K, :self.env.mu_obs_dim] = mu_obs_t
             all_obs_t[:, self.K:, :self.env.uav_obs_dim] = uav_obs_t
             all_ret_t = torch.cat([mu_data['returns'], uav_data['returns']], dim=1)
+            all_old_t = torch.cat([mu_data['values'], uav_data['values']], dim=1)
 
         total_al, total_cl, total_ent = 0, 0, 0
 
@@ -392,7 +433,7 @@ class ABMAPPO:
 
             # ---- Critic ----
             if self.use_attention:
-                cl = self._update_attention_critic(all_obs_t, all_ret_t)
+                cl = self._update_attention_critic(all_obs_t, all_ret_t, all_old_t)
             else:
                 cl = self._update_mlp_critic(mu_data, uav_data)
 
@@ -405,10 +446,19 @@ class ABMAPPO:
         n = cfg.PPO_EPOCHS
         return {'actor_loss': total_al/n, 'critic_loss': total_cl/n, 'entropy': total_ent/n}
 
-    def _update_attention_critic(self, all_obs, all_ret):
+    def _critic_value_loss(self, values: torch.Tensor, returns: torch.Tensor, old_values: torch.Tensor) -> torch.Tensor:
+        if bool(cfg.USE_VALUE_CLIP):
+            clip_eps = float(cfg.VALUE_CLIP_EPS)
+            clipped = old_values + torch.clamp(values - old_values, -clip_eps, clip_eps)
+            loss_unclipped = (values - returns) ** 2
+            loss_clipped = (clipped - returns) ** 2
+            return 0.5 * torch.max(loss_unclipped, loss_clipped).mean()
+        return 0.5 * ((values - returns) ** 2).mean()
+
+    def _update_attention_critic(self, all_obs, all_ret, all_old):
         with self._autocast_ctx():
             values = self.critic(all_obs).squeeze(-1)
-            loss = 0.5 * ((values - all_ret) ** 2).mean()
+            loss = self._critic_value_loss(values, all_ret, all_old)
 
         self.critic_optimizer.zero_grad(set_to_none=True)
         self.scaler.scale(loss).backward()
@@ -418,9 +468,8 @@ class ABMAPPO:
         return float(loss.item())
 
     def _update_mlp_critic(self, mu_data, uav_data):
-        mu_ret = mu_data['returns'].mean(dim=1, keepdim=True)
-        uav_ret = uav_data['returns'].mean(dim=1, keepdim=True)
-        avg_ret = (mu_ret + uav_ret) / 2
+        all_ret = torch.cat([mu_data['returns'], uav_data['returns']], dim=1)
+        all_old = torch.cat([mu_data['values'], uav_data['values']], dim=1)
 
         if 'states' not in mu_data or 'states' not in uav_data:
             raise KeyError("MLP critic update requires `states` in both MU and UAV batches")
@@ -441,7 +490,7 @@ class ABMAPPO:
 
         with self._autocast_ctx():
             values = self.critic(state)
-            loss = 0.5 * ((values - avg_ret) ** 2).mean()
+            loss = self._critic_value_loss(values, all_ret, all_old)
 
         self.critic_optimizer.zero_grad(set_to_none=True)
         self.scaler.scale(loss).backward()

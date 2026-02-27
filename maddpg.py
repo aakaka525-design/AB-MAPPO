@@ -106,7 +106,8 @@ class MADDPG:
         self.M = env.M
 
         # MU actor outputs association probabilities and offload ratio.
-        self.mu_assoc_dim = self.M + 1
+        # Match environment discrete choices: 0=local, 1..M=UAV direct, M+1=BS relay.
+        self.mu_assoc_dim = self.M + 2
         self.mu_cont_dim = 1
         self.mu_repr_dim = self.mu_assoc_dim + self.mu_cont_dim
         self.uav_action_dim = env.uav_continuous_dim
@@ -236,6 +237,7 @@ class MADDPG:
             "mu_reward": float(np.mean(mu_rewards_all)),
             "uav_reward": float(np.mean(uav_rewards_all)),
             "total_cost": float(-np.mean(mu_rewards_all)),
+            "collected_steps": int(cfg.EPISODE_LENGTH),
             "weighted_energy": float(np.mean([i["weighted_energy"] for i in ep_info])),
             "weighted_energy_mu_avg": float(np.mean([i["weighted_energy_mu_avg"] for i in ep_info])),
             "weighted_energy_mu_total": float(np.mean([i["weighted_energy_mu_total"] for i in ep_info])),

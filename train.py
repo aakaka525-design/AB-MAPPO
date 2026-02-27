@@ -44,6 +44,47 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--dt_deviation", type=float, default=cfg.DT_DEVIATION_RATE)
     parser.add_argument("--wo_dt_noise_mode", action="store_true")
+    parser.add_argument(
+        "--paper_mode",
+        type=str,
+        default=cfg.PAPER_MODE,
+        choices=["on", "off"],
+        help="Enable paper-aligned preset overrides for observation/reward/rollout settings.",
+    )
+    parser.add_argument(
+        "--normalize_reward",
+        type=str,
+        default="on" if cfg.NORMALIZE_REWARD else "off",
+        choices=["on", "off"],
+        help="Enable/disable running reward normalization.",
+    )
+    parser.add_argument(
+        "--reward_scale",
+        type=float,
+        default=cfg.REWARD_SCALE,
+        help="Override global REWARD_SCALE without changing source config.",
+    )
+    parser.add_argument(
+        "--uav_obs_mask_mode",
+        type=str,
+        default=cfg.UAV_OBS_MASK_MODE,
+        choices=["none", "prev_assoc"],
+        help="UAV observation mask mode.",
+    )
+    parser.add_argument(
+        "--rollout_mode",
+        type=str,
+        default=cfg.ROLLOUT_MODE,
+        choices=["fixed", "env_episode"],
+        help="Rollout collection mode for MAPPO-family agents.",
+    )
+    parser.add_argument(
+        "--bs_relay_policy",
+        type=str,
+        default=cfg.BS_RELAY_POLICY,
+        choices=["nearest", "best_snr", "min_load"],
+        help="Relay-UAV selection policy when MU chooses BS relay action (M+1).",
+    )
 
     # optional config overrides
     parser.add_argument("--bandwidth_mhz", type=float, default=None)
@@ -88,6 +129,7 @@ def _set_random_seed(seed):
 
 def _build_cfg_overrides(args):
     overrides = {"EPISODE_LENGTH": args.episode_length}
+    overrides["REWARD_SCALE"] = float(args.reward_scale)
     if args.bandwidth_mhz is not None:
         overrides["BANDWIDTH"] = args.bandwidth_mhz * 1e6
     if args.weight_factor is not None:
@@ -120,12 +162,49 @@ def _temporary_cfg(overrides):
             setattr(cfg, key, value)
 
 
-def _make_agent(env, algorithm, device):
+def _normalize_reward_flag(value):
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"on", "true", "1", "yes"}
+
+
+def _paper_mode_flag(value):
+    return str(value).strip().lower() in {"on", "true", "1", "yes"}
+
+
+def _apply_paper_mode_preset(args):
+    """Mutate args in-place with paper-aligned defaults when paper_mode is enabled."""
+    enabled = _paper_mode_flag(getattr(args, "paper_mode", "off"))
+    args.paper_mode = "on" if enabled else "off"
+    if not enabled:
+        return args
+
+    args.normalize_reward = "on" if bool(cfg.PAPER_PROFILE_NORMALIZE_REWARD) else "off"
+    args.reward_scale = float(cfg.PAPER_PROFILE_REWARD_SCALE)
+    args.uav_obs_mask_mode = str(cfg.PAPER_PROFILE_UAV_OBS_MASK_MODE)
+    args.rollout_mode = str(cfg.PAPER_PROFILE_ROLLOUT_MODE)
+    args.bs_relay_policy = str(cfg.PAPER_PROFILE_BS_RELAY_POLICY)
+    return args
+
+
+def _make_agent(env, algorithm, device, normalize_reward=True, rollout_mode=cfg.ROLLOUT_MODE):
     if algorithm == "MADDPG":
         return MADDPG(env, device=device)
     if algorithm == "Randomized":
-        return ABMAPPO(env, algorithm="Randomized", device=device)
-    return ABMAPPO(env, algorithm=algorithm, device=device)
+        return ABMAPPO(
+            env,
+            algorithm="Randomized",
+            device=device,
+            normalize_reward=normalize_reward,
+            rollout_mode=rollout_mode,
+        )
+    return ABMAPPO(
+        env,
+        algorithm=algorithm,
+        device=device,
+        normalize_reward=normalize_reward,
+        rollout_mode=rollout_mode,
+    )
 
 
 def _history_schema():
@@ -179,6 +258,12 @@ def _build_summary(args, history):
         "num_uavs": int(args.num_uavs),
         "total_steps": int(args.total_steps),
         "episode_length": int(args.episode_length),
+        "paper_mode": bool(_paper_mode_flag(args.paper_mode)),
+        "normalize_reward": bool(_normalize_reward_flag(args.normalize_reward)),
+        "reward_scale": float(args.reward_scale),
+        "uav_obs_mask_mode": str(args.uav_obs_mask_mode),
+        "rollout_mode": str(args.rollout_mode),
+        "bs_relay_policy": str(args.bs_relay_policy),
         "tail_metrics": tail,
         "num_episodes": int(len(history["episode"])),
         "tag": args.tag,
@@ -187,6 +272,7 @@ def _build_summary(args, history):
 
 def train(args):
     args.algorithm = _canonical_algo_name(args.algorithm)
+    args = _apply_paper_mode_preset(args)
     _set_random_seed(args.seed)
     device = setup_device(args.device)
 
@@ -225,11 +311,19 @@ def train(args):
             num_uavs=args.num_uavs,
             dt_deviation_rate=args.dt_deviation,
             wo_dt_noise_mode=args.wo_dt_noise_mode,
+            uav_obs_mask_mode=args.uav_obs_mask_mode,
+            bs_relay_policy=args.bs_relay_policy,
             area_width=args.area_width,
             area_height=args.area_height,
             seed=args.seed,
         )
-        agent = _make_agent(env, args.algorithm, device)
+        agent = _make_agent(
+            env,
+            args.algorithm,
+            device,
+            normalize_reward=_normalize_reward_flag(args.normalize_reward),
+            rollout_mode=args.rollout_mode,
+        )
 
         writer = None
         if not args.disable_tensorboard:
@@ -241,16 +335,25 @@ def train(args):
             except Exception:
                 writer = None
 
-        total_episodes = max(1, args.total_steps // args.episode_length)
+        target_steps = max(1, int(args.total_steps))
+        nominal_episode_len = max(1, int(args.episode_length))
+        estimated_total_episodes = max(1, int(np.ceil(target_steps / float(nominal_episode_len))))
         history = _history_schema()
 
         best_metric = float("inf")
         start_time = time.time()
+        episode = 0
+        step = 0
+        last_log_step = -1
 
-        for episode in range(1, total_episodes + 1):
+        while step < target_steps:
+            episode += 1
             episode_stats = agent.collect_episode()
             update_stats = agent.update()
-            step = episode * args.episode_length
+            collected_steps = int(episode_stats.get("collected_steps", nominal_episode_len))
+            if collected_steps <= 0:
+                collected_steps = nominal_episode_len
+            step = min(target_steps, step + collected_steps)
 
             history["episode"].append(episode)
             history["step"].append(step)
@@ -280,12 +383,14 @@ def train(args):
                 writer.add_scalar("Loss/Critic", history["critic_loss"][-1], step)
                 writer.add_scalar("Exploration/EntropyOrNoise", history["entropy"][-1], step)
 
-            should_log = (episode == 1) or (episode % max(1, total_episodes // 20) == 0)
+            log_stride = max(1, target_steps // 20)
+            should_log = (episode == 1) or (step >= target_steps) or (step - last_log_step >= log_stride)
             if should_log:
+                last_log_step = step
                 elapsed = max(1e-6, time.time() - start_time)
                 eps_per_sec = episode / elapsed
                 print(
-                    f"ep={episode:4d}/{total_episodes} step={step:7d} "
+                    f"ep={episode:4d}/{estimated_total_episodes} step={step:7d}/{target_steps} "
                     f"mu_r={history['mu_reward'][-1]:8.4f} uav_r={history['uav_reward'][-1]:8.4f} "
                     f"wE={history['weighted_energy_mu_avg'][-1]:8.4f} fairness={history['jain_fairness'][-1]:6.3f} "
                     f"viol={history['delay_violation'][-1]:6.3f} eps/s={eps_per_sec:5.2f}"
@@ -330,6 +435,12 @@ def namespace_from_kwargs(**kwargs):
         "seed": 42,
         "dt_deviation": cfg.DT_DEVIATION_RATE,
         "wo_dt_noise_mode": False,
+        "paper_mode": cfg.PAPER_MODE,
+        "normalize_reward": "on" if cfg.NORMALIZE_REWARD else "off",
+        "reward_scale": cfg.REWARD_SCALE,
+        "uav_obs_mask_mode": cfg.UAV_OBS_MASK_MODE,
+        "rollout_mode": cfg.ROLLOUT_MODE,
+        "bs_relay_policy": cfg.BS_RELAY_POLICY,
         "bandwidth_mhz": None,
         "weight_factor": None,
         "mu_max_cpu_ghz": None,

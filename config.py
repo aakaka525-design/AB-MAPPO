@@ -131,6 +131,8 @@ NUM_ATTENTION_HEADS = 4
 ENTROPY_COEFF = 0.01
 VALUE_LOSS_COEFF = 0.5
 MAX_GRAD_NORM = 10.0
+USE_VALUE_CLIP = True
+VALUE_CLIP_EPS = PPO_CLIP_EPSILON
 
 
 # ============================================================
@@ -141,9 +143,26 @@ PENALTY_DELAY = 0.1
 PENALTY_BOUNDARY = 0.1
 PENALTY_COLLISION = 0.1
 REWARD_SCALE = 10.0
+RESOURCE_SOFTMAX_TEMPERATURE = 1.0
+# To avoid double-counting UAV energy across MU/UAV rewards, default UAV self-energy term is disabled.
+UAV_REWARD_SELF_ENERGY_COEFF = 0.0
 
 D_MIN = 50.0
 D_TH = 300.0
+
+# Observation / training compatibility switches
+UAV_OBS_MASK_MODE = "none"
+NORMALIZE_REWARD = True
+ROLLOUT_MODE = "fixed"
+BS_RELAY_POLICY = "nearest"
+PAPER_MODE = "off"
+PAPER_PROFILE_NORMALIZE_REWARD = False
+PAPER_PROFILE_REWARD_SCALE = 1.0
+PAPER_PROFILE_UAV_OBS_MASK_MODE = "prev_assoc"
+PAPER_PROFILE_ROLLOUT_MODE = "env_episode"
+PAPER_PROFILE_BS_RELAY_POLICY = "best_snr"
+PAPER_PROFILE_RESOURCE_SOFTMAX_TEMPERATURE = 1.0
+PAPER_PROFILE_UAV_REWARD_SELF_ENERGY_COEFF = 0.0
 
 
 # ============================================================

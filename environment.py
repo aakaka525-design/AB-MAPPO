@@ -15,7 +15,7 @@ from typing import Dict, Tuple
 import numpy as np
 
 import config as cfg
-from channel_model import compute_mu_uav_rate, compute_mu_uav_rate_batch
+from channel_model import compute_mu_uav_rate, compute_mu_uav_rate_batch, compute_uav_bs_rate
 
 
 class UAVMECEnv:
@@ -27,6 +27,8 @@ class UAVMECEnv:
         num_uavs: int | None = None,
         dt_deviation_rate: float | None = None,
         wo_dt_noise_mode: bool = False,
+        uav_obs_mask_mode: str = cfg.UAV_OBS_MASK_MODE,
+        bs_relay_policy: str = cfg.BS_RELAY_POLICY,
         area_width: float | None = None,
         area_height: float | None = None,
         seed: int | None = None,
@@ -38,6 +40,12 @@ class UAVMECEnv:
             float(dt_deviation_rate) if dt_deviation_rate is not None else cfg.DT_DEVIATION_RATE
         )
         self.wo_dt_noise_mode = bool(wo_dt_noise_mode)
+        if uav_obs_mask_mode not in {"none", "prev_assoc"}:
+            raise ValueError("uav_obs_mask_mode must be one of {'none', 'prev_assoc'}")
+        self.uav_obs_mask_mode = str(uav_obs_mask_mode)
+        if bs_relay_policy not in {"nearest", "best_snr", "min_load"}:
+            raise ValueError("bs_relay_policy must be one of {'nearest', 'best_snr', 'min_load'}")
+        self.bs_relay_policy = str(bs_relay_policy)
 
         self.area_width = float(area_width if area_width is not None else cfg.AREA_WIDTH)
         self.area_height = float(area_height if area_height is not None else cfg.AREA_HEIGHT)
@@ -62,7 +70,8 @@ class UAVMECEnv:
 
         # MU observation/action dimensions
         self.mu_obs_dim = 2 + self.M * 2 + 2 + self.M
-        self.mu_discrete_dim = self.M + 1
+        # association: 0=local, 1..M=direct UAV offload, M+1=UAV-relayed BS offload
+        self.mu_discrete_dim = self.M + 2
         self.mu_continuous_dim = 1
         self.mu_action_dim = 2
 
@@ -85,6 +94,7 @@ class UAVMECEnv:
         self.task_cpu = np.zeros((self.K,), dtype=np.float32)
         self.prev_edge_load = np.zeros((self.M, self.K), dtype=np.float32)
         self.prev_offload_ratio = np.zeros((self.K,), dtype=np.float32)
+        self.prev_association = np.zeros((self.K,), dtype=np.int64)
         self._boundary_violation = np.zeros((self.M,), dtype=np.float32)
         # Pre-allocated work buffers for step() hot path.
         self._bw_alloc_cache = np.zeros((self.K,), dtype=np.float32)
@@ -123,6 +133,7 @@ class UAVMECEnv:
         self.uav_velocities = np.zeros((self.M, 2), dtype=np.float32)
         self.prev_edge_load = np.zeros((self.M, self.K), dtype=np.float32)
         self.prev_offload_ratio = np.zeros((self.K,), dtype=np.float32)
+        self.prev_association = np.zeros((self.K,), dtype=np.int64)
         self._boundary_violation = np.zeros((self.M,), dtype=np.float32)
         self._generate_tasks()
         return self._get_observations()
@@ -174,17 +185,21 @@ class UAVMECEnv:
 
     def _update_uav_positions(self, uav_velocity_actions: np.ndarray) -> None:
         target_v = (uav_velocity_actions * 2.0 - 1.0) * cfg.UAV_MAX_VELOCITY
-        dv = target_v - self.uav_velocities
+        v_prev = self.uav_velocities.copy()
+        dv = target_v - v_prev
         dv_norm = np.linalg.norm(dv, axis=1, keepdims=True)
         max_dv = cfg.UAV_MAX_ACCELERATION * cfg.TIME_SLOT
         scale = np.where(dv_norm > max_dv, max_dv / (dv_norm + 1e-8), 1.0)
-        self.uav_velocities += dv * scale
+        applied_dv = dv * scale
+        applied_acc = applied_dv / max(cfg.TIME_SLOT, 1e-8)
+        v_next = v_prev + applied_dv
 
-        v_norm = np.linalg.norm(self.uav_velocities, axis=1, keepdims=True)
+        v_norm = np.linalg.norm(v_next, axis=1, keepdims=True)
         scale_v = np.where(v_norm > cfg.UAV_MAX_VELOCITY, cfg.UAV_MAX_VELOCITY / (v_norm + 1e-8), 1.0)
-        self.uav_velocities *= scale_v
+        self.uav_velocities = v_next * scale_v
 
-        raw_pos = self.uav_positions + self.uav_velocities * cfg.TIME_SLOT
+        dt = cfg.TIME_SLOT
+        raw_pos = self.uav_positions + v_prev * dt + 0.5 * applied_acc * (dt**2)
         clipped = raw_pos.copy()
         clipped[:, 0] = np.clip(clipped[:, 0], 0.0, self.area_width)
         clipped[:, 1] = np.clip(clipped[:, 1], 0.0, self.area_height)
@@ -345,6 +360,9 @@ class UAVMECEnv:
         per_mu_view[:, :, 2] = self.prev_offload_ratio[None, :]
         per_mu_view[:, :, 3] = task_data_norm[None, :]
         per_mu_view[:, :, 4] = task_cpu_norm[None, :]
+        if self.uav_obs_mask_mode == "prev_assoc":
+            assoc_mask = self.prev_association[None, :] == (np.arange(self.M, dtype=np.int64)[:, None] + 1)
+            per_mu_view *= assoc_mask[:, :, None].astype(np.float32)
 
         if self.M > 1:
             other_uav = uav_pos_norm[self._other_uav_col_idx].reshape(self.M, self.M - 1, 2).reshape(self.M, -1)
@@ -352,15 +370,58 @@ class UAVMECEnv:
 
         return self._apply_wo_dt_noise({"mu_obs": mu_obs, "uav_obs": uav_obs})
 
+    def _select_bs_relay_uav(self, bs_indices: np.ndarray, effective_uav_idx: np.ndarray) -> np.ndarray:
+        """Select relay UAV index for BS-offloaded MUs according to configured policy."""
+        if bs_indices.size == 0:
+            return np.empty((0,), dtype=np.int64)
+
+        bs_mu_pos = self.mu_positions[bs_indices]
+        deltas = bs_mu_pos[:, None, :] - self.uav_positions[None, :, :]
+        dists = np.sqrt(np.sum(deltas**2, axis=2)).astype(np.float32)
+        if self.bs_relay_policy == "nearest":
+            return np.argmin(dists, axis=1).astype(np.int64)
+        if self.bs_relay_policy == "best_snr":
+            # Use equal per-link bandwidth to score first-hop MU->UAV quality.
+            bw = np.full((bs_indices.size,), cfg.BANDWIDTH, dtype=np.float32)
+            score = compute_mu_uav_rate_batch(
+                np.repeat(bs_mu_pos[:, None, :], self.M, axis=1).reshape(-1, 2),
+                np.repeat(self.uav_positions[None, :, :], bs_indices.size, axis=0).reshape(-1, 2),
+                np.repeat(bw[:, None], self.M, axis=1).reshape(-1),
+            ).reshape(bs_indices.size, self.M)
+            return np.argmax(score, axis=1).astype(np.int64)
+
+        # min_load: greedily assign each BS relay MU to the currently least-loaded UAV.
+        load = np.bincount(np.maximum(effective_uav_idx, -1) + 1, minlength=self.M + 1)[1:].astype(np.int64)
+        chosen = np.empty((bs_indices.size,), dtype=np.int64)
+        for i in range(bs_indices.size):
+            min_load = np.min(load)
+            candidates = np.where(load == min_load)[0]
+            if candidates.size == 1:
+                picked = int(candidates[0])
+            else:
+                picked = int(candidates[np.argmin(dists[i, candidates])])
+            chosen[i] = picked
+            load[picked] += 1
+        return chosen
+
     def step(self, mu_actions: Dict, uav_actions: np.ndarray) -> Tuple[Dict, Dict, bool, Dict]:
         association = np.asarray(mu_actions["association"], dtype=np.int64).copy()
         offload_ratio = np.asarray(mu_actions["offload_ratio"], dtype=np.float32).copy()
 
-        association = np.clip(association, 0, self.M)
+        bs_label = self.M + 1
+        association = np.clip(association, 0, bs_label)
         offload_ratio = np.clip(offload_ratio, 0.0, 1.0)
 
         local_mask = association == 0
         offload_ratio[local_mask] = 0.0
+        bs_mask = association == bs_label
+
+        effective_uav_idx = np.full((self.K,), -1, dtype=np.int64)
+        direct_assoc = (association > 0) & (association <= self.M)
+        effective_uav_idx[direct_assoc] = association[direct_assoc] - 1
+        if np.any(bs_mask):
+            bs_indices = np.where(bs_mask)[0]
+            effective_uav_idx[bs_indices] = self._select_bs_relay_uav(bs_indices, effective_uav_idx)
 
         uav_actions = np.asarray(uav_actions, dtype=np.float32)
         if uav_actions.shape != (self.M, self.uav_continuous_dim):
@@ -375,7 +436,8 @@ class UAVMECEnv:
         # 2) Resource allocation
         raw_bw = uav_actions[:, 2 : 2 + self.K]
         raw_cpu = uav_actions[:, 2 + self.K : 2 + 2 * self.K]
-        assoc_mus_list = [np.where(association == (m + 1))[0] for m in range(self.M)]
+        direct_assoc_mus_list = [np.where(association == (m + 1))[0] for m in range(self.M)]
+        assoc_mus_list = [np.where(effective_uav_idx == m)[0] for m in range(self.M)]
 
         bandwidth_alloc = self._bw_alloc_cache
         bandwidth_alloc.fill(0.0)
@@ -385,15 +447,26 @@ class UAVMECEnv:
         edge_load.fill(0.0)
 
         for m in range(self.M):
+            # OFDMA bandwidth is shared by all MU links associated with UAV m,
+            # including BS-relay first-hop links.
             assoc_mus = assoc_mus_list[m]
-            if len(assoc_mus) == 0:
-                continue
+            if len(assoc_mus) > 0:
+                temp = float(cfg.RESOURCE_SOFTMAX_TEMPERATURE)
+                if temp <= 0.0:
+                    bw_weights = np.full((len(assoc_mus),), 1.0 / float(len(assoc_mus)), dtype=np.float32)
+                else:
+                    bw_weights = self._softmax(raw_bw[m, assoc_mus] * temp)
+                bandwidth_alloc[assoc_mus] = bw_weights * cfg.BANDWIDTH
 
-            bw_weights = self._softmax(raw_bw[m, assoc_mus] * 3.0)
-            cpu_weights = self._softmax(raw_cpu[m, assoc_mus] * 3.0)
-
-            bandwidth_alloc[assoc_mus] = bw_weights * cfg.BANDWIDTH
-            cpu_alloc[assoc_mus] = cpu_weights * cfg.UAV_MAX_CPU_FREQ
+            # UAV CPU is only used by direct edge-compute tasks.
+            direct_assoc_mus = direct_assoc_mus_list[m]
+            if len(direct_assoc_mus) > 0:
+                temp = float(cfg.RESOURCE_SOFTMAX_TEMPERATURE)
+                if temp <= 0.0:
+                    cpu_weights = np.full((len(direct_assoc_mus),), 1.0 / float(len(direct_assoc_mus)), dtype=np.float32)
+                else:
+                    cpu_weights = self._softmax(raw_cpu[m, direct_assoc_mus] * temp)
+                cpu_alloc[direct_assoc_mus] = cpu_weights * cfg.UAV_MAX_CPU_FREQ
 
         # 3) Energy and latency
         l_all = self.task_data
@@ -419,36 +492,70 @@ class UAVMECEnv:
         np.copyto(mu_energy, e_loc_all)
         t_edge_all = self._t_edge_cache
         t_edge_all.fill(0.0)
+        # Non-flight UAV energy accumulator:
+        # - direct branch: UAV computing energy
+        # - relay branch: UAV forwarding transmission energy
         uav_comp_energy = self._uav_comp_cache
         uav_comp_energy.fill(0.0)
-        offload_mask = (association > 0) & (offload_ratio > 1e-8)
+        offload_mask = (effective_uav_idx >= 0) & (offload_ratio > 1e-8)
         offload_indices = np.where(offload_mask)[0]
         if offload_indices.size > 0:
-            uav_idx = association[offload_indices] - 1
-            bw = np.maximum(bandwidth_alloc[offload_indices], 1e3)
-            cpu = np.maximum(cpu_alloc[offload_indices], 1e3)
+            offload_assoc = association[offload_indices]
+            direct_mask = offload_assoc <= self.M
+            if np.any(direct_mask):
+                direct_indices = offload_indices[direct_mask]
+                uav_idx = effective_uav_idx[direct_indices]
+                bw = np.maximum(bandwidth_alloc[direct_indices], 1e3)
+                cpu = np.maximum(cpu_alloc[direct_indices], 1e3)
 
-            offload_data = offload_ratio[offload_indices] * l_all[offload_indices]
-            rates = compute_mu_uav_rate_batch(
-                self.mu_positions[offload_indices],
-                self.uav_positions[uav_idx],
-                bw,
-            ).astype(np.float32)
-            rates = np.maximum(rates, 1e3)
+                offload_data = offload_ratio[direct_indices] * l_all[direct_indices]
+                rates = compute_mu_uav_rate_batch(
+                    self.mu_positions[direct_indices],
+                    self.uav_positions[uav_idx],
+                    bw,
+                ).astype(np.float32)
+                rates = np.maximum(rates, 1e3)
 
-            t_off = offload_data / rates
-            e_off = cfg.MU_TRANSMIT_POWER * t_off
+                t_off = offload_data / rates
+                e_off = cfg.MU_TRANSMIT_POWER * t_off
 
-            y_edge = offload_ratio[offload_indices] * l_all[offload_indices] * c_all[offload_indices]
-            f_dev_edge = cpu * self.dt_deviation_rate * self.rng.uniform(-1.0, 1.0, size=offload_indices.size)
-            f_actual_edge = np.maximum(cpu + f_dev_edge, cpu * 0.1)
-            t_ecmp = y_edge / np.maximum(f_actual_edge, 1e3)
-            e_edge = cfg.EFFECTIVE_CAPACITANCE * (f_actual_edge**2) * y_edge
+                y_edge = offload_ratio[direct_indices] * l_all[direct_indices] * c_all[direct_indices]
+                f_dev_edge = cpu * self.dt_deviation_rate * self.rng.uniform(-1.0, 1.0, size=direct_indices.size)
+                f_actual_edge = np.maximum(cpu + f_dev_edge, cpu * 0.1)
+                t_ecmp = y_edge / np.maximum(f_actual_edge, 1e3)
+                e_edge = cfg.EFFECTIVE_CAPACITANCE * (f_actual_edge**2) * y_edge
 
-            mu_energy[offload_indices] += e_off.astype(np.float32)
-            t_edge_all[offload_indices] = (t_off + t_ecmp).astype(np.float32)
-            uav_comp_energy += np.bincount(uav_idx, weights=e_edge, minlength=self.M).astype(np.float32)
-            edge_load[uav_idx, offload_indices] = y_edge.astype(np.float32)
+                mu_energy[direct_indices] += e_off.astype(np.float32)
+                t_edge_all[direct_indices] = (t_off + t_ecmp).astype(np.float32)
+                uav_comp_energy += np.bincount(uav_idx, weights=e_edge, minlength=self.M).astype(np.float32)
+                edge_load[uav_idx, direct_indices] = y_edge.astype(np.float32)
+
+            relay_mask = offload_assoc == bs_label
+            if np.any(relay_mask):
+                relay_indices = offload_indices[relay_mask]
+                relay_uav = effective_uav_idx[relay_indices]
+                bw_first_hop = np.maximum(bandwidth_alloc[relay_indices], 1e3)
+                offload_data = offload_ratio[relay_indices] * l_all[relay_indices]
+
+                rates_mu_uav = compute_mu_uav_rate_batch(
+                    self.mu_positions[relay_indices],
+                    self.uav_positions[relay_uav],
+                    bw_first_hop,
+                ).astype(np.float32)
+                rates_mu_uav = np.maximum(rates_mu_uav, 1e3)
+                t_mu_uav = offload_data / rates_mu_uav
+                e_mu_uav = cfg.MU_TRANSMIT_POWER * t_mu_uav
+
+                rates_uav_bs = np.maximum(compute_uav_bs_rate(self.uav_positions[relay_uav]).astype(np.float32), 1e3)
+                t_uav_bs = offload_data / rates_uav_bs
+                e_uav_relay_tx = cfg.UAV_TRANSMIT_POWER * t_uav_bs
+
+                mu_energy[relay_indices] += e_mu_uav.astype(np.float32)
+                # BS-side compute delay is assumed negligible in the paper setting.
+                t_edge_all[relay_indices] = (t_mu_uav + t_uav_bs).astype(np.float32)
+                uav_comp_energy += np.bincount(relay_uav, weights=e_uav_relay_tx, minlength=self.M).astype(np.float32)
+                y_relay = offload_ratio[relay_indices] * l_all[relay_indices] * c_all[relay_indices]
+                edge_load[relay_uav, relay_indices] = y_relay.astype(np.float32)
 
         v = np.linalg.norm(self.uav_velocities, axis=1)
         term1 = 0.5 * cfg.FUSELAGE_DRAG_RATIO * cfg.AIR_DENSITY * cfg.ROTOR_SOLIDITY * cfg.ROTOR_DISC_AREA * (v**3)
@@ -461,7 +568,11 @@ class UAVMECEnv:
         np.add(uav_fly_energy, uav_comp_energy, out=uav_total_energy)
 
         # 4) Rewards
-        assoc_counts = np.bincount(association, minlength=self.M + 1)[1:]
+        valid_assoc = effective_uav_idx >= 0
+        if np.any(valid_assoc):
+            assoc_counts = np.bincount(effective_uav_idx[valid_assoc], minlength=self.M)
+        else:
+            assoc_counts = np.zeros((self.M,), dtype=np.int64)
         n_assoc_per_uav = np.maximum(assoc_counts, 1.0).astype(np.float32)
 
         latency_penalty_all = self._latency_penalty_cache
@@ -473,20 +584,19 @@ class UAVMECEnv:
 
         mu_rewards = self._mu_rewards_cache
         mu_rewards[:] = -mu_energy - latency_penalty_all
-        valid_assoc = association > 0
         if np.any(valid_assoc):
-            uav_indices = association[valid_assoc] - 1
+            uav_indices = effective_uav_idx[valid_assoc]
             mu_rewards[valid_assoc] -= (
                 cfg.WEIGHT_FACTOR * uav_total_energy[uav_indices] / n_assoc_per_uav[uav_indices]
             ).astype(np.float32)
         mu_rewards *= cfg.REWARD_SCALE
 
         uav_rewards = self._uav_rewards_cache
-        uav_rewards[:] = -cfg.WEIGHT_FACTOR * uav_total_energy
+        uav_rewards[:] = -np.float32(cfg.UAV_REWARD_SELF_ENERGY_COEFF) * uav_total_energy
         collision_penalties = self._collision_penalties()
         boundary_penalties = (cfg.PENALTY_BOUNDARY * self._boundary_violation).astype(np.float32)
         if np.any(valid_assoc):
-            assoc_uav = association[valid_assoc] - 1
+            assoc_uav = effective_uav_idx[valid_assoc]
             mu_energy_sum_per_uav = np.bincount(assoc_uav, weights=mu_energy[valid_assoc], minlength=self.M)
             latency_sum_per_uav = np.bincount(assoc_uav, weights=latency_penalty_all[valid_assoc], minlength=self.M)
             cooperative_penalty = (mu_energy_sum_per_uav + latency_sum_per_uav) / n_assoc_per_uav
@@ -500,6 +610,7 @@ class UAVMECEnv:
         # 5) State update
         self.prev_edge_load[:] = edge_load
         self.prev_offload_ratio[:] = offload_ratio
+        self.prev_association[:] = np.where(effective_uav_idx >= 0, effective_uav_idx + 1, 0).astype(np.int64)
         self._update_mu_mobility()
         self._generate_tasks()
         self.time_step += 1
@@ -513,11 +624,15 @@ class UAVMECEnv:
         weighted_energy_mu_avg = mu_energy_avg + cfg.WEIGHT_FACTOR * uav_energy_avg
         weighted_energy_mu_total = float(np.sum(mu_energy) + cfg.WEIGHT_FACTOR * np.sum(uav_total_energy))
 
-        # Fairness is computed over MU utility (inverse energy cost), not raw cost.
-        # This better reflects "service fairness" in paper-style comparisons.
+        # Paper-aligned fairness on MU energy costs.
+        fairness_denom = float(self.K * np.sum(mu_energy**2) + 1e-8)
+        jain_fairness = float((np.sum(mu_energy) ** 2) / fairness_denom) if fairness_denom > 0 else 1.0
+        # Legacy utility-based fairness retained for backward-compatible analysis scripts.
         mu_utility = 1.0 / (mu_energy + 1e-8)
-        fairness_denom = float(self.K * np.sum(mu_utility**2) + 1e-8)
-        jain_fairness = float((np.sum(mu_utility) ** 2) / fairness_denom) if fairness_denom > 0 else 1.0
+        utility_fairness_denom = float(self.K * np.sum(mu_utility**2) + 1e-8)
+        jain_fairness_utility = (
+            float((np.sum(mu_utility) ** 2) / utility_fairness_denom) if utility_fairness_denom > 0 else 1.0
+        )
 
         max_delay = np.maximum(t_loc_all, t_edge_all)
         info = {
@@ -531,6 +646,7 @@ class UAVMECEnv:
             "mu_energy_avg": mu_energy_avg,
             "uav_energy_avg": uav_energy_avg,
             "jain_fairness": jain_fairness,
+            "jain_fairness_utility": jain_fairness_utility,
             "avg_delay": float(np.mean(max_delay)),
             "delay_violation_rate": float(np.mean(max_delay > cfg.TIME_SLOT)),
         }

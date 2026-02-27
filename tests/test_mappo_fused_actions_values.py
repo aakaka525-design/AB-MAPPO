@@ -1,7 +1,9 @@
 import unittest
 from unittest.mock import patch
+import warnings
 
 import numpy as np
+import torch
 
 import config as cfg
 from environment import UAVMECEnv
@@ -84,6 +86,36 @@ class TestMAPPOFusedActionsValues(unittest.TestCase):
 
             self.assertIn("critic_loss", update_info)
             self.assertTrue(np.isfinite(update_info["critic_loss"]))
+
+    def test_values_from_state_warns_when_scalar_critic_is_broadcast(self):
+        with patch.object(cfg, "EPISODE_LENGTH", 2):
+            env = UAVMECEnv(num_mus=4, num_uavs=2, seed=19)
+            agent = ABMAPPO(env, algorithm="B-MAPPO", device="cpu")
+
+            class _ScalarCritic(torch.nn.Module):
+                def forward(self, state):
+                    return torch.tensor([[0.5]], dtype=state.dtype, device=state.device)
+
+            agent.critic = _ScalarCritic().to(agent.device)
+            with warnings.catch_warnings(record=True) as rec:
+                warnings.simplefilter("always")
+                mu_v, uav_v = agent._values_from_state()
+
+            self.assertEqual(mu_v.shape[0], env.K)
+            self.assertEqual(uav_v.shape[0], env.M)
+            self.assertTrue(any("scalar" in str(w.message).lower() for w in rec))
+
+    def test_critic_value_loss_uses_clipped_objective(self):
+        env = UAVMECEnv(num_mus=1, num_uavs=1, seed=23)
+        agent = ABMAPPO(env, algorithm="B-MAPPO", device="cpu")
+        values = torch.tensor([[2.0, -2.0]], dtype=torch.float32)
+        returns = torch.tensor([[0.0, 0.0]], dtype=torch.float32)
+        old_values = torch.tensor([[0.0, 0.0]], dtype=torch.float32)
+        with patch.object(cfg, "USE_VALUE_CLIP", True), patch.object(cfg, "VALUE_CLIP_EPS", 0.1):
+            loss = agent._critic_value_loss(values, returns, old_values)
+        clipped = old_values + torch.clamp(values - old_values, -0.1, 0.1)
+        expected = 0.5 * torch.max((values - returns) ** 2, (clipped - returns) ** 2).mean()
+        self.assertTrue(torch.allclose(loss, expected, atol=1e-6))
 
 
 if __name__ == "__main__":
